@@ -2,3 +2,9 @@ src/r1-v/debug_log_2b.txt
 __pycache__/
 wandb/
 gold-model/
+
+# Data files - keep test datasets small (< 50MB)
+# Ignore large dataset files (but allow small test datasets)
+data/**/*.arrow
+!data/**/data-00000-of-00001.arrow
+data/**/*.parquet

@@ -52,7 +52,7 @@ python trl/experimental/gold/gold.py \
 #     --lora_alpha 16
 
 # 8 GPUs LoRA training
-torchrun --nproc_per_node=8 \
+torchrun --nproc_per_node=4 \
   --nnodes=1 \
   --node_rank=0 \
   --master_addr=127.0.0.1 \
@@ -63,17 +63,18 @@ torchrun --nproc_per_node=8 \
   --teacher_model_name_or_path Qwen/Qwen3-4B-Instruct-2507 \
   --dataset_name trl-lib/chatbot_arena_completions \
   --learning_rate 2e-4 \
-  --per_device_train_batch_size 4 \
-  --gradient_accumulation_steps 8 \
+  --per_device_train_batch_size 2 \
+  --gradient_accumulation_steps 16 \
   --output_dir gold-model \
   --num_train_epochs 1 \
   --push_to_hub \
   --use_peft \
   --lora_r 64 \
   --lora_alpha 16 \
-  --gradient_checkpointing false\
+  --gradient_checkpointing true \
   --report_to wandb \
-  --run_name Qwen2.5-1.5B-Instruct-to-Qwen3-4B-Instruct-2507-Gold-8GPUs-LoRA-64
+  --run_name Qwen2.5-1.5B-Instruct-to-Qwen3-4B-Instruct-2507-Gold-4GPUs-LoRA-64 \
+  --max_length 1024
 """
 
 from datasets import load_dataset
