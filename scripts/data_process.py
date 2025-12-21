@@ -1,41 +1,26 @@
+"""
+Independent data processing script: 80/20 split by modality and task type
+for cross-modality and cross-task experiments.
+
+This script is completely independent of data_process.py and will not
+affect the original data processing pipeline.
+"""
+
 import json
-
-json_path = "/data/datasets/OmniMedVQA/OmniMedVQA/QA_information/Open-access/ACRIMA.json"
-with open(json_path, "r") as f:
-    acrima_data = json.load(f)
-
-print(f"Loaded {len(acrima_data)} items from {json_path}")
-
-restricted_json_path = "/data/datasets/OmniMedVQA/OmniMedVQA/QA_information/Restricted-access/AIDA.json"
-with open(restricted_json_path, "r") as f:
-    aida_data = json.load(f)
-
-print(f"Loaded {len(aida_data)} items from {restricted_json_path}")
-
 import os
-
-open_access_dir = "/data/datasets/OmniMedVQA/OmniMedVQA/QA_information/Open-access"
-open_access_files = os.listdir(open_access_dir)
-print("Files in Open-access directory:", open_access_files)
-
-restricted_access_dir = "/data/datasets/OmniMedVQA/OmniMedVQA/QA_information/Restricted-access"
-restricted_access_files = os.listdir(restricted_access_dir)
-print("Files in Restricted-access directory:", restricted_access_files)
-
-# Combine all json files in the open-access directory
-import json
-
-open_access_data = []
-for file in open_access_files:
-    with open(os.path.join(open_access_dir, file), "r") as f:
-        data = json.load(f)
-        open_access_data.extend(data)
-
-print(f"Total items in Open-access dataset: {len(open_access_data)}")
+import random
+from collections import defaultdict
+from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
+from PIL import Image as PILImage
+from datasets import DatasetDict, Dataset, Features, Value, Image as DatasetImage
+import argparse
 
 def convert_raw_data_to_sft_data(data):
     """
     Convert raw data to SFT data
+    Copied from data_process.py to maintain format consistency
 
     data example:
     {
@@ -58,24 +43,18 @@ def convert_raw_data_to_sft_data(data):
         "problem": "question",
         "solution": "answer"
     }
-
-    Args:
-        data: list of raw data
-    Returns:
-        list of SFT data
     """
     sft_data = []
     for item in data:
         required_keys = ["image_path", "question", "gt_answer"]
-        # Find all keys that start with "option_" in this item and add them to required_keys (if not already present)
         option_keys = [k for k in item.keys() if k.startswith("option_")]
         assert len(option_keys) > 0, f"No option keys found in item: {item}"
         required_keys.extend([k for k in option_keys if k not in required_keys])
 
-        # Build the multiple-choice prompt: "Question\nA: xxx\nB: yyy\n..."
+        # Build the multiple-choice prompt
         options_str = "\n".join([f"{k[-1]}: {item[k]}" for k in option_keys])
 
-        # Map the ground-truth answer text back to its option letter (A/B/C/...)
+        # Map the ground-truth answer text back to its option letter
         gt_text = str(item["gt_answer"]).strip()
         correct_letter = None
         for k in option_keys:
@@ -84,7 +63,6 @@ def convert_raw_data_to_sft_data(data):
                 correct_letter = k[-1]
                 break
 
-        # If we somehow cannot find a matching option, fall back to using the raw text
         if correct_letter is None:
             correct_token = gt_text
         else:
@@ -92,36 +70,18 @@ def convert_raw_data_to_sft_data(data):
 
         sft_data.append(
             {
-            "image": item["image_path"],
+                "image": item["image_path"],
                 "problem": item["question"] + "\n" + options_str,
-                # For GRPO reward function we want the answer *letter*, e.g. "<answer> C </answer>"
                 "solution": f"<answer> {correct_token} </answer>",
             }
         )
 
     return sft_data
 
-# Convert open-access data to SFT data
-open_access_sft_data = convert_raw_data_to_sft_data(open_access_data)
-
-# Save the SFT data to a json file
-with open("/data/datasets/OmniMedVQA/OmniMedVQA/open_access_sft_data.json", "w") as f:
-    json.dump(open_access_sft_data, f)
-
-# Load the SFT data from a json file
-with open("/data/datasets/OmniMedVQA/OmniMedVQA/open_access_sft_data.json", "r") as f:
-    open_access_sft_data = json.load(f)
-
-import os
-from datasets import DatasetDict, Dataset, Features, Value, Image as DatasetImage
-from contextlib import contextmanager
-from tqdm import tqdm
-from PIL import Image as PILImage
-
-save_path = "open_access_sft_data_hf"  # relative path; will be created in current working directory
 
 @contextmanager
 def pushd(path):
+    """Context manager for changing directory"""
     prev = os.getcwd()
     os.chdir(path)
     try:
@@ -129,55 +89,523 @@ def pushd(path):
     finally:
         os.chdir(prev)
 
-dataset_root = "/data/datasets/OmniMedVQA/OmniMedVQA"
 
-hf_dict = {
-    "image": [],
-    "problem": [],
-    "solution": [],
-}
-
-def load_image_from_path(image_path):
+def load_image_from_path(image_path, dataset_dir=None):
+    """Load and resize image to 384x384"""
     try:
+        # Convert relative path to absolute path if needed
+        if not os.path.isabs(image_path):
+            if dataset_dir is None:
+                dataset_dir = "/data/datasets/OmniMedVQA/OmniMedVQA"
+            image_path = os.path.join(dataset_dir, image_path)
+        
+        # Check if file exists
+        if not os.path.exists(image_path):
+            return None
+        
         img = PILImage.open(image_path).convert("RGB")
-        # Resize to 384 x 384 as described in the README
         img = img.resize((384, 384))
         return img
     except Exception as e:
-        print(f"Error loading image {image_path}: {str(e)}. Image path: {image_path}")
+        # Only print error for debugging, don't spam output
+        # print(f"Error loading image {image_path}: {str(e)}")
         return None
 
-# Define the features for the HuggingFace dataset, using PIL Image type for images
-features = Features({
-    "image": DatasetImage(),
-    "problem": Value("string"),
-    "solution": Value("string"),
-})
 
-"""
-Note: To avoid excessive memory usage while debugging the pipeline,
-we only build a small HF subset instead of all 88k examples.
-You can increase `max_samples` later once everything runs end‑to‑end.
-"""
+# ============================================================================
+# Split-related functions
+# ============================================================================
 
-MAX_SAMPLES = 5000  # temporary small subset for debugging
+def normalize_modality_name(modality_str):
+    """
+    Normalize modality_type from raw data to the 8 modalities in the paper.
+    
+    The 8 modalities in the paper:
+    - CT (15,808 samples)
+    - MRI (31,877 samples)
+    - X-Ray (7,916 samples)
+    - Ultrasound (10,991 samples)
+    - Dermoscopy (6,679 samples)
+    - Fundus (5,398 samples)
+    - OCT (4,646 samples)
+    - Microscopy (5,680 samples)
+    """
+    modality_str = str(modality_str).strip()
+    # Mapping rules (adjust based on actual data)
+    modality_map = {
+        # CT
+        'CT': 'CT',
+        'Computed Tomography': 'CT',
+        # MRI
+        'MRI': 'MRI',
+        'Magnetic Resonance Imaging': 'MRI',
+        # X-Ray
+        'X-Ray': 'X-Ray',
+        'X-ray': 'X-Ray',
+        'X-Ray Imaging': 'X-Ray',
+        # Ultrasound
+        'Ultrasound': 'Ultrasound',
+        'US': 'Ultrasound',
+        # Dermoscopy
+        'Dermoscopy': 'Dermoscopy',
+        'Dermatoscopy': 'Dermoscopy',
+        # Fundus
+        'Fundus Photography': 'Fundus',
+        'Fundus': 'Fundus',
+        'FP': 'Fundus',
+        # OCT
+        'OCT': 'OCT',
+        'Optical Coherence Tomography': 'OCT',
+        # Microscopy
+        'Microscopy': 'Microscopy',
+        'Micro': 'Microscopy',
+    }
+    # Try exact match
+    if modality_str in modality_map:
+        return modality_map[modality_str]
+    # Try case-insensitive match
+    for key, value in modality_map.items():
+        if key.lower() == modality_str.lower():
+            return value
+    # If no match, return original value (can be manually checked later)
+    return modality_str
 
-# Collect the SFT data into the hf_dict
-with pushd(dataset_root):
-    print("start to convert")
-    for i, item in enumerate(tqdm(open_access_sft_data)):
-        if i >= MAX_SAMPLES:
-            break
-        hf_dict["image"].append(load_image_from_path(item["image"]))
-        hf_dict["problem"].append(item["problem"])
-        hf_dict["solution"].append(item["solution"])
 
-    # Place the SFT data into the 'train' split of a DatasetDict
-    train_dataset = Dataset.from_dict(hf_dict, features=features)
-    open_access_sft_dataset = DatasetDict({"train": train_dataset})
+def normalize_task_name(task_str):
+    """
+    Normalize question_type from raw data to the 5 task types in the paper.
+    
+    The 5 task types in the paper:
+    - Anatomy Identification (16,448 samples)
+    - Disease Diagnosis (55,387 samples)
+    - Lesion Grading (2,098 samples)
+    - Modality Recognition (11,565 samples)
+    - Other Biological Attributes (3,498 samples)
+    """
+    task_str = str(task_str).strip()
+    task_map = {
+        'Anatomy Identification': 'Anatomy Identification',
+        'Disease Diagnosis': 'Disease Diagnosis',
+        'Lesion Grading': 'Lesion Grading',
+        'Modality Recognition': 'Modality Recognition',
+        'Other Biological Attributes': 'Other Biological Attributes',
+        'Biological Attribute Analysis': 'Other Biological Attributes',
+    }
+    if task_str in task_map:
+        return task_map[task_str]
+    for key, value in task_map.items():
+        if key.lower() == task_str.lower():
+            return value
+    return task_str
 
-    print("start to save")
-    # Save the dataset to disk
-    open_access_sft_dataset.save_to_disk(save_path)
 
+def split_data_by_group(data, group_key_func, train_ratio=0.8, seed=42):
+    """
+    Group data by group_key_func, then perform train/test split for each group.
+    
+    Args:
+        data: List of raw data items
+        group_key_func: Function that takes an item and returns a group key
+        train_ratio: Training ratio (default 0.8, i.e., 80/20 split)
+        seed: Random seed
+    Returns:
+        dict: {group_key: {'train': [...], 'test': [...]}}
+    """
+    random.seed(seed)
+    
+    # Group by group_key
+    grouped_data = defaultdict(list)
+    for item in data:
+        group_key = group_key_func(item)
+        grouped_data[group_key].append(item)
+    
+    # Perform split for each group
+    splits = {}
+    for group_key, items in grouped_data.items():
+        random.shuffle(items)
+        split_idx = int(len(items) * train_ratio)
+        splits[group_key] = {
+            'train': items[:split_idx],
+            'test': items[split_idx:]
+        }
+        print(f"  {group_key}: {len(items)} samples -> "
+              f"train: {len(splits[group_key]['train'])}, "
+              f"test: {len(splits[group_key]['test'])}")
+    
+    return splits
+
+
+def process_single_split(group_key, split_name, raw_items, split_type, 
+                         max_samples_per_split, num_workers, dataset_dir, dataset_output_dir,
+                         ):
+    """
+    Process a single split (e.g., CT_train) and save it.
+    This function is designed to be called in parallel.
+    """
+    # Clean special characters in group_key for file paths
+    safe_key = group_key.replace(' ', '_').replace('/', '_')
+    
+    # Save path: open_access_sft_data_hf_modality_CT_train, etc.
+    save_path_split = (f"open_access_sft_data_hf_{split_type}_"
+                        f"{safe_key}_{split_name}")
+    
+    # Use absolute path from the start
+    abs_save_path = os.path.join(dataset_output_dir, save_path_split)
+
+    # Check if HF dataset already exists
+    if os.path.exists(abs_save_path) and split_name == "train":
+        print(f"    [{group_key} {split_name}] HF dataset already exists: {save_path_split}")
+        print(f"    [{group_key} {split_name}] Skipping HF save (delete to regenerate)")
+        return f"{group_key} {split_name}"
+    if os.path.exists(abs_save_path) and split_name == "test":
+        # Check if JSON file already exists
+        json_dir = os.path.join(dataset_output_dir, "eval_json", split_type)
+        os.makedirs(json_dir, exist_ok=True)
+        json_path = os.path.join(json_dir, f"{safe_key}_test.json")
+        
+        if os.path.exists(json_path):
+            print(f"    [{group_key} {split_name}] HF and JSON files already exist: {save_path_split} and {json_path}")
+            print(f"    [{group_key} {split_name}] Skipping HF and JSON generation (delete to regenerate)")
+            return f"{group_key} {split_name}"
+
+    else:
+        print(f"    [{group_key} {split_name}] HF dataset does not exist: {save_path_split}")
+        print(f"    [{group_key} {split_name}] Generating HF dataset...")
+
+    # Define the features for the HuggingFace dataset
+    features = Features({
+        "image": DatasetImage(),
+        "problem": Value("string"),
+        "solution": Value("string"),
+    })
+    
+    # Limit sample count (for testing)
+    if max_samples_per_split is not None and len(raw_items) > max_samples_per_split:
+        print(f"    [{group_key} {split_name}] Limiting to "
+              f"{max_samples_per_split} samples (for testing)")
+        raw_items = raw_items[:max_samples_per_split]
+    
+    # Convert to SFT format
+    sft_items = convert_raw_data_to_sft_data(raw_items)
+    
+    # Build HuggingFace dataset
+    hf_dict = {
+        "image": [],
+        "problem": [],
+        "solution": [],
+    }
+    
+    # Also save image paths for JSON conversion
+    image_paths = []
+    
+    # Remove pushd to avoid parallel chdir conflicts
+    # Use absolute paths throughout
+    print(f"    [{group_key} {split_name}] Processing "
+          f"{len(sft_items)} samples (using {num_workers} threads)...")
+    
+    # Parallel image loading using ThreadPoolExecutor
+    def load_image_with_metadata(item):
+        """Load image and return with metadata"""
+        img = load_image_from_path(item["image"], dataset_dir=dataset_dir)
+        return {
+            "image": img,
+            "problem": item["problem"],
+            "solution": item["solution"],
+            "success": img is not None
+        }
+    
+    # Use ThreadPoolExecutor for parallel image loading
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Submit all tasks, keeping track of which item corresponds to which future
+        future_to_item = {
+            executor.submit(load_image_with_metadata, item): item
+            for item in sft_items
+        }
+        
+        # Process completed tasks with progress bar
+        for future in tqdm(as_completed(future_to_item), 
+                          total=len(sft_items), 
+                          desc=f"  {group_key} {split_name}"):
+            result = future.result()
+            if result["success"]:  # Skip failed image loads
+                hf_dict["image"].append(result["image"])
+                hf_dict["problem"].append(result["problem"])
+                hf_dict["solution"].append(result["solution"])
+                # Save original image path for JSON conversion (only for test splits)
+                original_item = future_to_item[future]
+                image_paths.append(original_item["image"])
+
+    # If no valid images were loaded, skip this split to avoid empty datasets
+    num_examples = len(hf_dict["image"])
+    if num_examples == 0:
+        print(f"    [{group_key} {split_name}] No valid images loaded, skipping this split.")
+    else:
+        print(f"    [{group_key} {split_name}] Building DatasetDict with {num_examples} examples...")
+        # Create DatasetDict
+        split_dataset = Dataset.from_dict(hf_dict, features=features)
+        dataset_dict = DatasetDict({split_name: split_dataset})
+        
+        # Check if HF dataset already exists
+        if os.path.exists(abs_save_path):
+            print(f"    [{group_key} {split_name}] HF dataset already exists: {save_path_split}")
+            print(f"    [{group_key} {split_name}] Skipping HF save (delete to regenerate)")
+        else:
+            print(f"    [{group_key} {split_name}] "
+                  f"Saving to: {abs_save_path}")
+            try:
+                # Use absolute path directly, no pushd needed
+                dataset_dict.save_to_disk(abs_save_path)
+                # Verify the save was successful
+                if not os.path.exists(abs_save_path):
+                    raise RuntimeError(
+                        f"Save completed but folder not found: "
+                        f"{abs_save_path}")
+                print(f"    [{group_key} {split_name}] "
+                      f"Successfully saved to: {save_path_split}")
+            except Exception as e:
+                print(f"    ✗ [{group_key} {split_name}] "
+                      f"ERROR saving HF dataset: {e}")
+                print(f"    [{group_key} {split_name}] "
+                      f"Save path: {save_path_split}")
+                print(f"    [{group_key} {split_name}] "
+                      f"Full path: {abs_save_path}")
+                import traceback
+                traceback.print_exc()
+                raise  # Re-raise to be caught by outer handler
+            
+        # Also save JSON file for evaluation (only for test splits)
+        if split_name == "test":
+            # Check if JSON file already exists
+            json_dir = os.path.join(dataset_output_dir, "eval_json", split_type)
+            os.makedirs(json_dir, exist_ok=True)
+            json_path = os.path.join(json_dir, f"{safe_key}_test.json")
+            
+            if os.path.exists(json_path):
+                print(f"    [{group_key} {split_name}] JSON file already exists: {json_path}")
+                print(f"    [{group_key} {split_name}] Skipping JSON generation (delete to regenerate)")
+            else:
+                json_data = [
+                    {
+                        "image": img_path,
+                        "problem": prob,
+                        "solution": sol
+                    }
+                    for img_path, prob, sol in zip(
+                        image_paths, hf_dict["problem"], hf_dict["solution"]
+                    )
+                ]
+                with open(json_path, 'w', encoding='utf-8') as f:
+                    json.dump(json_data, f, indent=2, ensure_ascii=False)
+                print(f"    [{group_key} {split_name}] Saved JSON to: {json_path}")
+        
+        print(f"    [{group_key} {split_name}] Completed!")
+    
+    return f"{group_key} {split_name}"
+
+
+def save_split_dataset(dataset_dir, dataset_output_dir, splits, split_type, max_samples_per_split=None, 
+                      num_workers=4, parallel_datasets=4, 
+                      test_only=False):
+    """
+    Convert splits to SFT format and save as HuggingFace datasets.
+    Now processes multiple datasets in parallel.
+    
+    Args:
+        dataset_output_dir: Path to save the split datasets
+        splits: {group_key: {'train': [...], 'test': [...]}}
+        split_type: 'modality' or 'task'
+        max_samples_per_split: Maximum samples per split (for testing,
+            None means no limit)
+        num_workers: Number of threads for parallel image loading within each dataset
+        parallel_datasets: Number of datasets to process in parallel (default: 4)
+    """
+    # Collect all (group_key, split_name) pairs to process
+    tasks = []
+    for group_key, split_data in splits.items():
+        if test_only:
+            # Only process test splits
+            if 'test' in split_data:
+                tasks.append((group_key, 'test', split_data['test']))
+        else:
+            # Process both train and test splits
+            for split_name in ['train', 'test']:
+                tasks.append((group_key, split_name, split_data[split_name]))
+    
+    if test_only:
+        print(f"    Processing {len(tasks)} test splits only (skipping train splits)")
+    else:
+        print(f"    Total {len(tasks)} splits to process")
+    print(f"    Processing {parallel_datasets} datasets in parallel")
+    print(f"    Each dataset uses {num_workers} threads for image loading")
+    
+    # Process datasets in parallel
+    with ThreadPoolExecutor(max_workers=parallel_datasets) as executor:
+        # Submit all tasks
+        futures = {
+            executor.submit(
+                process_single_split,
+                group_key, split_name, raw_items, split_type,
+                max_samples_per_split, num_workers, dataset_dir, dataset_output_dir
+            ): (group_key, split_name)
+            for group_key, split_name, raw_items in tasks
+        }
+        
+        # Wait for all tasks to complete
+        for future in tqdm(as_completed(futures), 
+                          total=len(futures), 
+                          desc="Processing datasets"):
+            group_key, split_name = futures[future]
+            try:
+                result = future.result()
+                print(f"    ✓ Completed: {result}")
+            except Exception as e:
+                print(f"    ✗ Error processing {group_key} {split_name}: {e}")
+                raise
+
+
+# ============================================================================
+# Main pipeline
+# ============================================================================
+
+def main():
+    """
+    Main function to generate 80/20 split datasets by modality and task type.
+
+    Args:
+        open_access_dir: Path to the Open-access QA dataset directory
+        dataset_dir: Path to the dataset directory
+        dataset_output_dir: Path to save the split datasets
+        test_only: Only process test splits (skip train splits)
+        process_categories: Categories to process (modality, task)
+
+
+    Returns:
+        None
+
+    Example:
+        # Download the Open-access QA dataset and save it to /mnt/task_runtime/data/datasets/OmniMedVQA/
+        huggingface-cli download foreverbeliever/OmniMedVQA \
+            --repo-type dataset \
+            --local-dir /mnt/task_runtime/data/datasets/OmniMedVQA && 
+        # Unzip the dataset
+        unzip /mnt/task_runtime/data/datasets/OmniMedVQA/OmniMedVQA.zip -d /mnt/task_runtime/data/datasets/OmniMedVQA/ &&
+        # Process the split datasets
+        python scripts/data_process_split.py --open_access_dir /mnt/task_runtime/data/datasets/OmniMedVQA/OmniMedVQA/QA_information/Open-access --dataset_dir /mnt/task_runtime/data/datasets/OmniMedVQA/OmniMedVQA --dataset_output_dir /mnt/task_runtime/data/datasets/OmniMedVQA/OmniMedVQA
+    """ 
+    parser = argparse.ArgumentParser(
+        description="Generate 80/20 split datasets by modality and task type"
+    )
+    parser.add_argument(
+        "--open_access_dir",
+        type=str,
+        default="/data/datasets/OmniMedVQA/OmniMedVQA/QA_information/Open-access",
+        help="Path to the Open-access QA dataset directory"
+    )
+    parser.add_argument(
+        "--dataset_dir",
+        type=str,
+        default="/data/datasets/OmniMedVQA/OmniMedVQA",
+        help="Path to the dataset directory"
+    )
+    parser.add_argument(
+        "--dataset_output_dir",
+        type=str,
+        default="/data/datasets/OmniMedVQA/OmniMedVQA",
+        help="Path to save the split datasets"
+    )
+    parser.add_argument(
+        "--test_only",
+        action="store_true",
+        help="Only process test splits (skip train splits)"
+    )
+    parser.add_argument(
+        "--process_categories",
+        nargs="+",
+        default=["modality", "task"],
+        help="Categories to process (modality, task)"
+    )
+    
+    args = parser.parse_args()
+    
+    print("="*80)
+    print("Generating 80/20 split datasets by modality and task type")
+    if args.test_only:
+        print("Mode: Processing test splits only")
+    print("="*80)
+    
+    # 1. Load raw data
+    print("\n[Step 1/4] Loading raw data...")
+    open_access_files = os.listdir(args.open_access_dir)
+    print(f"Found {len(open_access_files)} JSON files")
+    
+    open_access_data = []
+    for file in open_access_files:
+        with open(os.path.join(args.open_access_dir, file), "r") as f:
+            data = json.load(f)
+            open_access_data.extend(data)
+    
+    print(f"Total loaded {len(open_access_data)} raw data items")
+    
+    # 2. Group by modality and split
+    print("\n[Step 2/4] Grouping by modality_type and performing 80/20 split...")
+    modality_splits = split_data_by_group(
+        open_access_data,
+        group_key_func=lambda item: normalize_modality_name(
+            item.get('modality_type', 'Unknown')
+        )
+    )
+    
+    # 3. Group by question_type and split
+    print("\n[Step 3/4] Grouping by question_type and performing 80/20 split...")
+    task_splits = split_data_by_group(
+        open_access_data,
+        group_key_func=lambda item: normalize_task_name(
+            item.get('question_type', 'Unknown')
+        )
+    )
+    
+    # 4. Convert to SFT format and save
+    print("\n[Step 4/4] Converting to SFT format and saving...")
+    
+    if "modality" in args.process_categories:
+        # Save modality splits
+        print("\nSaving modality splits...")
+        # For testing, set max_samples_per_split to a small number first
+        # After confirming it works, set to None to process all data
+        # num_workers: threads per dataset for image loading
+        # parallel_datasets: number of datasets to process simultaneously
+        save_split_dataset(args.dataset_dir, args.dataset_output_dir, modality_splits, 'modality', 
+                        max_samples_per_split=None,
+                        num_workers=64,      # Threads per dataset for image loading
+                        parallel_datasets=18,  # Number of datasets in parallel
+                        test_only=args.test_only,
+                        )
+
+    if "task" in args.process_categories:
+        # Save task splits
+        print("\nSaving task splits...")
+        save_split_dataset(args.dataset_dir, args.dataset_output_dir, task_splits, 'task', 
+                        max_samples_per_split=None,
+                        num_workers=64,      # Threads per dataset for image loading
+                        parallel_datasets=18,  # Number of datasets in parallel
+                        test_only=args.test_only,
+                        )
+    
+    print("\n" + "="*80)
+    print("Split dataset generation completed!")
+    print("="*80)
+    print("\nGenerated dataset path format:")
+    print("  - Cross-modality: "
+          "open_access_sft_data_hf_modality_{MODALITY}_{train|test}")
+    print("  - Cross-task: "
+          "open_access_sft_data_hf_task_{TASK}_{train|test}")
+    print("\nExamples:")
+    print("  - open_access_sft_data_hf_modality_CT_train")
+    print("  - open_access_sft_data_hf_modality_CT_test")
+    print("  - open_access_sft_data_hf_task_Disease_Diagnosis_train")
+    print("  - open_access_sft_data_hf_task_Disease_Diagnosis_test")
+
+
+if __name__ == "__main__":
+    main()
 
