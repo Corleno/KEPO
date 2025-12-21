@@ -8,3 +8,6 @@ gold-model/
 data/**/*.arrow
 !data/**/data-00000-of-00001.arrow
 data/**/*.parquet
+
+# Archive files
+scripts/archive/
