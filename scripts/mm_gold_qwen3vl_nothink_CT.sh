@@ -13,7 +13,7 @@ torchrun --nproc_per_node=8 \
          --model_name_or_path Qwen/Qwen3-VL-2B-Instruct \
          --deepspeed src/training_configs/zero3.json \
          --teacher_model_name_or_path Qwen/Qwen3-VL-4B-Instruct \
-         --dataset_name data/open_access_sft_data_hf_modality_OCT_train_test \
+         --dataset_name "/mnt/task_runtime/data/omni_med_vqa_processed/open_access_sft_data_hf_modality_CT(Computed_Tomography)_train" \
          --learning_rate 2e-5 \
          --logging_steps 1 \
          --per_device_train_batch_size 4 \
