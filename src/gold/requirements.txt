@@ -1,6 +1,7 @@
 trl>=0.26.1
 liger_kernel>=0.6.4
-vllm>=0.12.0
+# latest trl only support vllm<=11.2
+vllm==0.11.2
 peft
 wandb
 deepspeed
