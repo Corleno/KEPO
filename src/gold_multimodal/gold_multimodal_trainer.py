@@ -76,6 +76,7 @@ class DataCollatorForMMChatML:
     max_length: int = None
     prompt_key: str = "prompt"
     messages_key: str = "messages"
+    required_features: list[str] = ["input_ids", "attention_mask", "labels", "pixel_values", "image_grid_thw", "prompts", "prompt_attention_mask"]
 
     def _drop_null_image_in_text(self, messages):
         # Remove unnecessary 'image' field from text parts and 'text' field from image parts
@@ -96,6 +97,7 @@ class DataCollatorForMMChatML:
         prompts_input_ids = []
         prompt_attention_mask = []
         labels = []
+        images = []
 
         
 
@@ -109,7 +111,7 @@ class DataCollatorForMMChatML:
                 prompt = messages[:-1]
                 if not isinstance(prompt, list):
                     prompt = [prompt]
-
+                # The apply_chat_template function converts the conversation to a single prompt, in which the image is converted to text <|vision_start|><|image_pad|><|vision_end|>.
                 formatted_prompt = self.processor.apply_chat_template(
                     prompt, tokenize=False, add_generation_prompt=True
                 )
@@ -122,6 +124,7 @@ class DataCollatorForMMChatML:
                 add_special_tokens=False,
             )
             formatted_prompt_input_ids = tokenized_formatted_prompt["input_ids"][0]
+            images.append(example["image"])
             pixel_values.append(tokenized_formatted_prompt["pixel_values"])
             image_grid_thw.append(tokenized_formatted_prompt["image_grid_thw"][0])
             completion_start_idx_full = len(formatted_prompt_input_ids)
@@ -186,7 +189,7 @@ class DataCollatorForMMChatML:
         prompts_input_ids = pad(prompts_input_ids, padding_side="left", padding_value=self.processor.tokenizer.pad_token_id)
         prompt_attention_mask = pad(prompt_attention_mask, padding_side="left", padding_value=0)
 
-        return {
+        return_dict = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "labels": labels,
@@ -194,7 +197,10 @@ class DataCollatorForMMChatML:
             "image_grid_thw": image_grid_thw,
             "prompts": prompts_input_ids,
             "prompt_attention_mask": prompt_attention_mask,
+            "images": images,
         }
+
+        return {feature: return_dict[feature] for feature in self.required_features}
 
 if is_peft_available():
     from peft import PeftConfig
@@ -1058,6 +1064,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
                     )
                     self.vllm_client.init_communicator()
             elif self.vllm_mode == "colocate":
+                assert False, "Colocate mode is not supported for multimodal models."
                 student_model_name_or_path = self.model_name_or_path
 
                 # Make sure tensor_parallel_size divides world size evenly
@@ -1591,6 +1598,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
     def generate_on_policy_outputs(self, model, inputs, generation_config, pad_token_id=None):
         # Generate output with respect to the prompt only
         if self.use_transformers_paged:
+            assert False, "Paged attention is not implemented for multimodal models"
             previous_attn = self.model.config._attn_implementation
             if is_flash_attn_2_available():
                 model.config._attn_implementation = "paged_attention"
@@ -1613,6 +1621,8 @@ class GOLDMultimodalTrainer(SFTTrainer):
         else:
             generated_outputs = model.generate(
                 input_ids=inputs["prompts"],
+                pixel_values=inputs["pixel_values"],
+                image_grid_thw=inputs["image_grid_thw"],
                 attention_mask=inputs.get("prompt_attention_mask", None),
                 generation_config=generation_config,
                 return_dict_in_generate=True,
@@ -1624,7 +1634,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
         device = generated_tokens.device
 
         prompt_mask = inputs.get("prompt_attention_mask")
-        pad_token_id = pad_token_id if pad_token_id is not None else self.processing_class.pad_token_id
+        pad_token_id = pad_token_id if pad_token_id is not None else self.processing_class.tokenizer.pad_token_id
 
         if prompt_mask is not None:
             prompt_lengths = prompt_mask.sum(dim=1).to(torch.long)
@@ -1645,8 +1655,9 @@ class GOLDMultimodalTrainer(SFTTrainer):
             new_attention_mask[new_input_ids == pad_token_id] = 0
 
         new_labels = torch.full_like(new_input_ids, -100)
+        length = prompt_mask.shape[1]
         for idx in range(batch_size):
-            length = int(prompt_lengths[idx].item())
+            # length = int(prompt_lengths[idx].item())
             new_labels[idx, length:] = new_input_ids[idx, length:]
 
         if pad_token_id is not None:
@@ -1654,8 +1665,10 @@ class GOLDMultimodalTrainer(SFTTrainer):
 
         prompt_texts = []
         completion_texts = []
+
+        length = prompt_mask.shape[1]
         for idx in range(batch_size):
-            length = int(prompt_lengths[idx].item())
+            # length = int(prompt_lengths[idx].item())
             prompt_tokens = inputs["prompts"][idx]
             if prompt_mask is not None:
                 prompt_tokens = prompt_tokens[prompt_mask[idx].bool()]
@@ -1690,8 +1703,8 @@ class GOLDMultimodalTrainer(SFTTrainer):
             # clean_up_tokenization_spaces=False # Keep this commented unless specific issues arise
         )
         # Remove padding token text if it appears, as vLLM expects clean prompts
-        if self.processing_class.pad_token:
-            prompts_text_for_vllm = [p.replace(self.processing_class.pad_token, "") for p in prompts_text_for_vllm]
+        if self.processing_class.tokenizer.pad_token:
+            prompts_text_for_vllm = [p.replace(self.processing_class.tokenizer.pad_token, "") for p in prompts_text_for_vllm]
 
         # Also decode prompts WITH special tokens for ULD loss computation
         prompts_text_with_special = self.processing_class.batch_decode(
@@ -1699,6 +1712,19 @@ class GOLDMultimodalTrainer(SFTTrainer):
             skip_special_tokens=False,
         )
 
+        merge_length = self.processing_class.image_processor.merge_size**2
+
+        index = 0
+        prompts_text_for_vllm_with_image_tokens = []
+        for prompt in prompts_text_with_special:
+            while self.processing_class.image_token in prompt:
+                num_image_tokens = inputs["image_grid_thw"][index].prod() // merge_length
+                prompt = prompt.replace(self.processing_class.image_token * num_image_tokens, "<image>", 1)
+                index += 1
+            # skip all special tokens
+            prompt = self.processing_class.tokenizer.decode(self.processing_class.tokenizer.encode(prompt), skip_special_tokens=True)
+            prompts_text_for_vllm_with_image_tokens.append(prompt)
+        
         # system_prompt = "Please reason step by step, and put your final answer within \\boxed{}."
         # target_system_prompt = "You are Qwen, created by Alibaba Cloud. You are a helpful assistant."
         # prompts_text = [p.replace(target_system_prompt, system_prompt) for p in prompts_text]
@@ -1714,10 +1740,11 @@ class GOLDMultimodalTrainer(SFTTrainer):
         min_p = self.args.min_p if hasattr(self.args, "min_p") else 0.0
 
         if self.vllm_mode == "server":
-            all_prompts_text = gather_object(prompts_text_for_vllm)
+            all_prompts_text = gather_object(prompts_text_for_vllm_with_image_tokens)
             if self.accelerator.is_main_process:
                 completion_ids = self.vllm_client.generate(
                     prompts=all_prompts_text,
+                    images=inputs["images"],
                     n=1,  # In GKD, we generate 1 completion per prompt from student
                     repetition_penalty=repetition_penalty,
                     temperature=temperature,
@@ -1735,7 +1762,9 @@ class GOLDMultimodalTrainer(SFTTrainer):
                 (self.accelerator.process_index + 1) * len(prompts_text_for_vllm),
             )
             completion_ids = completion_ids[process_slice]
+            import pdb; pdb.set_trace()
         elif self.vllm_mode == "colocate":
+            assert False, "Colocate mode is not implemented for multimodal models"
             # Build kwargs for SamplingParams in a way that is compatible with
             # both old (GuidedDecodingParams) and new (StructuredOutputsParams)
             # vLLM structured decoding APIs.
@@ -1979,7 +2008,6 @@ class GOLDMultimodalTrainer(SFTTrainer):
             on_policy = True
             if self.use_vllm:
                 self._wake_vllm_if_needed()
-                import pdb; pdb.set_trace()
                 result = self._generate_on_policy_outputs_vllm(
                     inputs, self.generation_config, self.processing_class.tokenizer.pad_token_id
                 )
