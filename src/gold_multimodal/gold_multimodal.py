@@ -64,6 +64,7 @@ torchrun --nproc_per_node=8 \
 
 from datasets import load_dataset, load_from_disk
 from transformers import AutoTokenizer, GenerationConfig, AutoProcessor
+from functools import partial
 
 from trl import (
     LogCompletionsCallback,
@@ -74,12 +75,17 @@ from trl import (
     get_peft_config,
     get_quantization_config,
 )
-from .gold_multimodal_config import GOLDMultimodalConfig
+from .gold_multimodal_config import GOLDMultimodalConfig, GOLDMultimodalScriptArguments
 from .gold_multimodal_trainer import GOLDMultimodalTrainer
+from .reward_funcs import accuracy_reward, format_reward
 
+reward_funcs_registry = {
+    "accuracy": accuracy_reward,
+    "format": partial(format_reward, pattern=r"<answer>.*?</answer>"),
+}
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, GOLDMultimodalConfig, ModelConfig))
+    parser = TrlParser((GOLDMultimodalScriptArguments, GOLDMultimodalConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
 
     ################
@@ -173,12 +179,18 @@ if __name__ == "__main__":
         else:
             eval_dataset = None
 
+        # Get reward functions
+        reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
+    else:
+        reward_funcs = []
+
     ################
     # Training
     ################
     trainer = GOLDMultimodalTrainer(
         model=model_args.model_name_or_path,
         teacher_model=training_args.teacher_model_name_or_path,
+        reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,

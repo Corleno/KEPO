@@ -19,7 +19,7 @@ import warnings
 from collections import defaultdict, deque
 from collections.abc import Callable
 from contextlib import nullcontext
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import torch
 import torch.distributed as dist
@@ -46,7 +46,7 @@ from transformers.utils import (
     is_peft_available,
     is_rich_available,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from trl.data_utils import is_conversational, maybe_convert_to_chatml, pack_dataset, truncate_dataset
 from trl.extras.profiling import profiling_decorator
@@ -76,7 +76,18 @@ class DataCollatorForMMChatML:
     max_length: int = None
     prompt_key: str = "prompt"
     messages_key: str = "messages"
-    required_features: list[str] = ["input_ids", "attention_mask", "labels", "pixel_values", "image_grid_thw", "prompts", "prompt_attention_mask"]
+    required_features: list[str] = field(
+        default_factory=lambda: [
+            "input_ids",
+            "attention_mask",
+            "labels",
+            "pixel_values",
+            "image_grid_thw",
+            "prompts",
+            "prompt_attention_mask",
+            "solutions",
+        ]
+    )
 
     def _drop_null_image_in_text(self, messages):
         # Remove unnecessary 'image' field from text parts and 'text' field from image parts
@@ -98,6 +109,7 @@ class DataCollatorForMMChatML:
         prompt_attention_mask = []
         labels = []
         images = []
+        solutions = []
 
         
 
@@ -125,6 +137,7 @@ class DataCollatorForMMChatML:
             )
             formatted_prompt_input_ids = tokenized_formatted_prompt["input_ids"][0]
             images.append(example["image"])
+            solutions.append(example["solution"])
             pixel_values.append(tokenized_formatted_prompt["pixel_values"])
             image_grid_thw.append(tokenized_formatted_prompt["image_grid_thw"][0])
             completion_start_idx_full = len(formatted_prompt_input_ids)
@@ -198,6 +211,7 @@ class DataCollatorForMMChatML:
             "prompts": prompts_input_ids,
             "prompt_attention_mask": prompt_attention_mask,
             "images": images,
+            "solutions": solutions,
         }
 
         return {feature: return_dict[feature] for feature in self.required_features}
@@ -869,7 +883,53 @@ class GOLDVLLMSyncCallback(TrainerCallback):
                 self.trainer._last_vllm_sync_step = state.global_step
 
 
+# What we call a reward function is a callable that takes a list of prompts and completions and returns a list of
+# rewards. When it's a string, it's a model ID, so it's loaded as a pretrained model.
+RewardFunc = Union[str, PreTrainedModel, Callable[[list, list], list[float]]]
+
 class GOLDMultimodalTrainer(SFTTrainer):
+    """
+    Trainer for the GOLD multimodal model.
+
+    Args:
+        model: The model to train.
+        teacher_model: The teacher model to use for distillation.
+        reward_funcs (`Union[RewardFunc, list[RewardFunc]]`):
+            Reward functions to be used for computing the rewards. To compute the rewards, we call all the reward
+            functions with the prompts and completions and sum the rewards. Can be either:
+
+            - A single reward function, such as:
+                - A string: The *model ID* of a pretrained model hosted inside a model repo on huggingface.co, or a
+                path to a *directory* containing model weights saved using
+                [`~transformers.PreTrainedModel.save_pretrained`], e.g., `'./my_model_directory/'`. The model is loaded
+                using [`~transformers.AutoModelForSequenceClassification.from_pretrained`] with `num_labels=1` and the
+                keyword arguments in `args.model_init_kwargs`.
+                - A [`~transformers.PreTrainedModel`] object: Only sequence classification models are supported.
+                - A custom reward function: The function is provided with the prompts and the generated completions,
+                  plus any additional columns in the dataset. It should return a list of rewards. For more details, see
+                  [Using a custom reward function](#using-a-custom-reward-function).
+            - A list of reward functions, where each item can independently be any of the above types. Mixing different
+            types within the list (e.g., a string model ID and a custom reward function) is allowed.
+        args: The arguments to use for training.
+        data_collator: The data collator to use for training.
+        train_dataset: The training dataset to use for training.
+        eval_dataset: The evaluation dataset to use for training.
+        processing_class: The processing class to use for training.
+        reward_processing_classes (`Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]`, *optional*, defaults to `None`):
+            Processing classes corresponding to the reward functions specified in `reward_funcs`. Can be either:
+
+            - A single processing class: Used when `reward_funcs` contains only one reward function.
+            - A list of processing classes: Must match the order and length of the reward functions in `reward_funcs`.
+            If set to `None`, or if an element of the list corresponding to a [`~transformers.PreTrainedModel`] is
+            `None`, the tokenizer for the model is automatically loaded using [`~transformers.AutoTokenizer.from_pretrained`].
+            For elements in `reward_funcs` that are custom reward functions (not [`~transformers.PreTrainedModel`]),
+            the corresponding entries in `reward_processing_classes` are ignored.
+        compute_metrics: The metrics to use for training.
+        callbacks: The callbacks to use for training.
+        optimizers: The optimizers to use for training.
+        preprocess_logits_for_metrics: The preprocess logits for metrics to use for training.
+        peft_config: The PEFT config to use for training.
+    """
     _tag_names = ["trl", "gold_multimodal"]
     _name = "GOLDMultimodal"
     _paper = {
@@ -888,6 +948,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
         self,
         model: PreTrainedModel | nn.Module | str | None = None,
         teacher_model: PreTrainedModel | nn.Module | str = None,
+        reward_funcs: Union[RewardFunc, list[RewardFunc]] = None,
         args: GOLDMultimodalConfig | None = None,
         data_collator: DataCollator | None = None,  # type: ignore
         train_dataset: Dataset | None = None,
@@ -897,6 +958,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
         | FeatureExtractionMixin
         | ProcessorMixin
         | None = None,
+        reward_processing_classes: Optional[Union[PreTrainedTokenizerBase, list[PreTrainedTokenizerBase]]] = None,
         compute_metrics: Callable[[EvalPrediction], dict] | None = None,
         callbacks: list[TrainerCallback] | None = None,
         optimizers: tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
@@ -979,13 +1041,59 @@ class GOLDMultimodalTrainer(SFTTrainer):
         if not args.use_uld_loss:
             teacher_model.resize_token_embeddings(self.model.config.text_config.vocab_size)
 
-        if self.is_deepspeed_enabled:
-            self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+        if args.alpha > 0.0:
+            if self.is_deepspeed_enabled:
+                self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
+            else:
+                self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
         else:
-            self.teacher_model = self.accelerator.prepare_model(teacher_model, evaluation_mode=True)
+            self.teacher_model = None
 
+        if args.alpha < 1.0:
+            ref_model = create_model_from_path(model, **args.model_init_kwargs)
+            # initialize the reference model for GPRO
+            if self.is_deepspeed_enabled:
+                self.ref_model = prepare_deepspeed(ref_model, self.accelerator)
+            else:
+                self.ref_model = self.accelerator.prepare_model(ref_model, evaluation_mode=True)
+        else:
+            self.ref_model = None
+
+        # Reward functions
+        if not isinstance(reward_funcs, list):
+            reward_funcs = [reward_funcs]
+        for i, reward_func in enumerate(reward_funcs):
+            if isinstance(reward_func, str):
+                reward_funcs[i] = AutoModelForSequenceClassification.from_pretrained(
+                    reward_func, num_labels=1, **model_init_kwargs
+                )
+        self.reward_funcs = reward_funcs
+
+        # Reward processing class
+        if reward_processing_classes is None:
+            reward_processing_classes = [None] * len(reward_funcs)
+        elif not isinstance(reward_processing_classes, list):
+            reward_processing_classes = [reward_processing_classes]
+        else:
+            if len(reward_processing_classes) != len(reward_funcs):
+                raise ValueError("The number of reward processing classes must match the number of reward functions.")
+
+        for i, (reward_processing_class, reward_func) in enumerate(zip(reward_processing_classes, reward_funcs)):
+            if isinstance(reward_func, PreTrainedModel):
+                if reward_processing_class is None:
+                    reward_processing_class = AutoTokenizer.from_pretrained(reward_func.config._name_or_path)
+                if reward_processing_class.pad_token_id is None:
+                    reward_processing_class.pad_token = reward_processing_class.eos_token
+                # The reward model computes the reward for the latest non-padded token in the input sequence.
+                # So it's important to set the pad token ID to the padding token ID of the processing class.
+                reward_func.config.pad_token_id = reward_processing_class.pad_token_id
+                reward_processing_classes[i] = reward_processing_class
+        self.reward_processing_classes = reward_processing_classes
+
+        self.alpha = args.alpha
         self.lmbda = args.lmbda
         self.beta = args.beta
+        self.beta_rl = args.beta_rl
         self.temperature = args.temperature
         self.top_p = args.top_p
         self.seq_kd = args.seq_kd
@@ -1020,6 +1128,16 @@ class GOLDMultimodalTrainer(SFTTrainer):
             do_sample=True,
             top_k=args.top_k,
             pad_token_id=self.processing_class.tokenizer.pad_token_id,
+        )
+
+        self.generation_rl_config = GenerationConfig(
+            max_new_tokens=args.max_completion_length,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            do_sample=True,
+            top_k=args.top_k,
+            pad_token_id=self.processing_class.tokenizer.pad_token_id,
+            num_return_sequences=args.num_generations,
         )
         if (
             hasattr(self.model.generation_config, "eos_token_id")
@@ -1143,6 +1261,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
             "tools",
             "original_prompt_text",
             "original_completion_text",
+            "solution",
         ]
         if self._signature_columns is None:
             self._signature_columns = required_columns
@@ -1163,6 +1282,9 @@ class GOLDMultimodalTrainer(SFTTrainer):
         """
         Override dataset preparation to preserve original text for cross-tokenizer distillation and ensure
         attention_mask is always added for DataCollatorForChatML compatibility.
+        This function is not used for multimodal models, It skips dataset preparation if `skip_prepare_dataset=True` 
+        in `dataset_kwargs`, or if it's a VLM, since preprocessing (e.g., image-to-pixel conversion) is too costly 
+        and done on the fly instead.
         """
         # Check if dataset is already processed
         column_names = list(next(iter(dataset)).keys())
@@ -1489,112 +1611,6 @@ class GOLDMultimodalTrainer(SFTTrainer):
         else:
             return jsd
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        if self.use_uld_loss and self.teacher_tokenizer is not None:
-            raise NotImplementedError("ULD loss is not implemented for multimodal models")
-        else:
-            if self.use_liger_gkd_loss:
-                # Forward only through the base models (avoid lm_head to save memory)
-                unwrapped_student = self.accelerator.unwrap_model(model)
-                if hasattr(unwrapped_student, "get_decoder") and unwrapped_student.get_decoder() is not None:
-                    base_student = unwrapped_student.get_decoder()
-                else:
-                    base_student = getattr(
-                        unwrapped_student, getattr(unwrapped_student, "base_model_prefix", "model"), unwrapped_student
-                    )
-
-                student_outputs = base_student(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    pixel_values=inputs["pixel_values"],
-                    image_grid_thw=inputs["image_grid_thw"],
-                    use_cache=False,
-                )
-
-                self.teacher_model.eval()
-                unwrapped_teacher = self.accelerator.unwrap_model(self.teacher_model)
-                if hasattr(unwrapped_teacher, "get_decoder") and unwrapped_teacher.get_decoder() is not None:
-                    base_teacher = unwrapped_teacher.get_decoder()
-                else:
-                    base_teacher = getattr(
-                        unwrapped_teacher, getattr(unwrapped_teacher, "base_model_prefix", "model"), unwrapped_teacher
-                    )
-                with torch.no_grad():
-                    teacher_outputs = base_teacher(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        pixel_values=inputs["pixel_values"],
-                        image_grid_thw=inputs["image_grid_thw"],
-                        use_cache=False,
-                    )
-
-                # hidden states (shifted)
-                student_hidden = student_outputs.last_hidden_state[:, :-1]
-                teacher_hidden = teacher_outputs.last_hidden_state[:, :-1]
-
-                # Release full outputs to free memory
-                del student_outputs, teacher_outputs
-
-                # labels mask and labels (shifted)
-                labels_mask = inputs["labels"] != -100
-                masked_input_ids = torch.where(
-                    labels_mask, inputs["input_ids"], torch.full_like(inputs["input_ids"], -100)
-                )
-                true_labels = masked_input_ids[:, 1:].contiguous()
-
-                # heads
-                student_head = unwrapped_student.get_output_embeddings()
-                teacher_head = unwrapped_teacher.get_output_embeddings()
-
-                # liger fused jsd loss
-                loss = self.liger_jsd_loss(
-                    student_input=student_hidden,
-                    student_weight=student_head.weight,
-                    teacher_input=teacher_hidden,
-                    teacher_weight=teacher_head.weight,
-                    true_labels=true_labels,
-                    student_bias=getattr(student_head, "bias", None),
-                    teacher_bias=getattr(teacher_head, "bias", None),
-                )
-
-                # Release hidden states after loss computation
-                del student_hidden, teacher_hidden, true_labels
-            else:
-                # Original behavior for same tokenizer or when teacher_tokenizer is not provided
-                outputs_student = model(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    pixel_values=inputs["pixel_values"],
-                    image_grid_thw=inputs["image_grid_thw"],
-                )
-
-                self.teacher_model.eval()
-                with torch.no_grad():
-                    outputs_teacher = self.teacher_model(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        pixel_values=inputs["pixel_values"],
-                        image_grid_thw=inputs["image_grid_thw"],
-                    )
-
-                prompt_lengths = inputs["prompts"].shape[1]
-                shifted_student_logits = outputs_student.logits[:, prompt_lengths - 1 : -1, :]
-                shifted_teacher_logits = outputs_teacher.logits[:, prompt_lengths - 1 : -1, :]
-                shifted_labels = inputs["labels"][:, prompt_lengths:]
-                loss = self.generalized_jsd_loss(
-                    student_logits=shifted_student_logits,
-                    teacher_logits=shifted_teacher_logits,
-                    labels=shifted_labels,
-                    beta=self.beta,
-                )
-
-        if self.use_uld_loss:
-            raise NotImplementedError("ULD loss is not implemented for multimodal models")
-
-        empty_cache()
-
-        return (loss, outputs_student) if return_outputs else loss
-
     def generate_on_policy_outputs(self, model, inputs, generation_config, pad_token_id=None):
         # Generate output with respect to the prompt only
         if self.use_transformers_paged:
@@ -1619,9 +1635,16 @@ class GOLDMultimodalTrainer(SFTTrainer):
             completion_ids = [output.generated_tokens for output in generated_outputs.values()]
             generated_tokens = torch.stack([torch.tensor(ids, device=model.device) for ids in completion_ids])
         else:
+            num_generations = generation_config.num_return_sequences
+            if num_generations > 1:
+                # Flatten the first two dimensions of the pixel_values tensor.
+                pixel_values = inputs["pixel_values"].view(-1, inputs["pixel_values"].shape[-1])
+            else:
+                pixel_values = inputs["pixel_values"]
+
             generated_outputs = model.generate(
                 input_ids=inputs["prompts"],
-                pixel_values=inputs["pixel_values"],
+                pixel_values=pixel_values,
                 image_grid_thw=inputs["image_grid_thw"],
                 attention_mask=inputs.get("prompt_attention_mask", None),
                 generation_config=generation_config,
@@ -1633,18 +1656,19 @@ class GOLDMultimodalTrainer(SFTTrainer):
         batch_size = generated_tokens.size(0)
         device = generated_tokens.device
 
-        prompt_mask = inputs.get("prompt_attention_mask")
+        new_prompts = inputs["prompts"].repeat_interleave(num_generations, dim=0)
+        prompt_mask = inputs.get("prompt_attention_mask").repeat_interleave(num_generations, dim=0)
         pad_token_id = pad_token_id if pad_token_id is not None else self.processing_class.tokenizer.pad_token_id
 
         if prompt_mask is not None:
             prompt_lengths = prompt_mask.sum(dim=1).to(torch.long)
         else:
             if pad_token_id is not None:
-                prompt_lengths = (inputs["prompts"] != pad_token_id).sum(dim=1).to(torch.long)
+                prompt_lengths = (new_prompts != pad_token_id).sum(dim=1).to(torch.long)
             else:
                 prompt_lengths = torch.full(
                     (batch_size,),
-                    inputs["prompts"].shape[1],
+                    new_prompts.shape[1],
                     dtype=torch.long,
                     device=device,
                 )
@@ -1669,7 +1693,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
         length = prompt_mask.shape[1]
         for idx in range(batch_size):
             # length = int(prompt_lengths[idx].item())
-            prompt_tokens = inputs["prompts"][idx]
+            prompt_tokens = new_prompts[idx]
             if prompt_mask is not None:
                 prompt_tokens = prompt_tokens[prompt_mask[idx].bool()]
             elif pad_token_id is not None:
@@ -1690,7 +1714,17 @@ class GOLDMultimodalTrainer(SFTTrainer):
                 )
             )
 
+        # print(new_input_ids.shape, new_attention_mask.shape, new_labels.shape)
+        # print(prompt_texts)
+        # print(completion_texts)
+
         return new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts
+
+    def skip_special_tokens_from_text(self, text):
+        return self.processing_class.tokenizer.decode(self.processing_class.tokenizer.encode(text), skip_special_tokens=True)
+
+    def skip_special_tokens_from_text_list(self, text_list):
+        return [self.skip_special_tokens_from_text(text) for text in text_list]
 
     @profiling_decorator
     def _generate_on_policy_outputs_vllm(self, inputs, generation_config, pad_token_id=None):
@@ -1722,7 +1756,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
                 prompt = prompt.replace(self.processing_class.image_token * num_image_tokens, "<image>", 1)
                 index += 1
             # skip all special tokens
-            prompt = self.processing_class.tokenizer.decode(self.processing_class.tokenizer.encode(prompt), skip_special_tokens=True)
+            prompt = self.skip_special_tokens_from_text(prompt)
             prompts_text_for_vllm_with_image_tokens.append(prompt)
         
         # system_prompt = "Please reason step by step, and put your final answer within \\boxed{}."
@@ -1762,7 +1796,6 @@ class GOLDMultimodalTrainer(SFTTrainer):
                 (self.accelerator.process_index + 1) * len(prompts_text_for_vllm),
             )
             completion_ids = completion_ids[process_slice]
-            import pdb; pdb.set_trace()
         elif self.vllm_mode == "colocate":
             assert False, "Colocate mode is not implemented for multimodal models"
             # Build kwargs for SamplingParams in a way that is compatible with
@@ -1992,9 +2025,266 @@ class GOLDMultimodalTrainer(SFTTrainer):
             empty_cache()
             self.vllm_engine.wake_up(tags=["kv_cache"])
 
+    # Get the per-token log probabilities for the completions for the model and the reference model
+    def _get_per_token_logps(self, model, input_ids, attention_mask, pixel_values, image_grid_thw):
+        logits = model(input_ids, attention_mask=attention_mask, pixel_values=pixel_values, image_grid_thw=image_grid_thw).logits  # (B, L, V)
+        logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
+        input_ids = input_ids[:, 1:]  # (B, L-1), exclude the first input ID since we don't have logits for it
+        # Compute the log probabilities for the input tokens. Use a loop to reduce memory peak.
+        per_token_logps = []
+        for logits_row, input_ids_row in zip(logits, input_ids):
+            log_probs = logits_row.log_softmax(dim=-1)
+            token_log_prob = torch.gather(log_probs, dim=1, index=input_ids_row.unsqueeze(1)).squeeze(1)
+            per_token_logps.append(token_log_prob)
+        return torch.stack(per_token_logps)
+
+    def _on_policy_sampling(self, model, inputs, accelerator=None, generate_on_policy_outputs=None, generation_config=None, processing_class=None):
+        
+        if accelerator is None:
+            accelerator = self.accelerator
+        if generate_on_policy_outputs is None:
+            generate_on_policy_outputs = self.generate_on_policy_outputs
+        if generation_config is None:
+            generation_config = self.generation_config
+        if processing_class is None:
+            processing_class = self.processing_class
+
+        with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
+            result = generate_on_policy_outputs(
+                unwrapped_model, inputs, generation_config, processing_class.tokenizer.pad_token_id
+            )
+            new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
+        return new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts
+
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, verbose=True):
+        if self.use_rl_loss:
+            assert return_outputs is False, "return_outputs must be False for RL loss"
+
+            device = self.accelerator.device
+            prompt_ids = inputs["prompts"]
+            prompt_length = prompt_ids.size(1)
+            num_generations = self.generation_rl_config.num_return_sequences
+
+            # Generate completions
+            new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = self._on_policy_sampling(model, inputs, generation_config = self.generation_rl_config)
+            
+            pixel_values = inputs["pixel_values"].repeat_interleave(num_generations, dim=0)
+            image_grid_thw = inputs["image_grid_thw"].repeat_interleave(num_generations, dim=0)
+            per_token_logps = self._get_per_token_logps(model, new_input_ids, new_attention_mask, pixel_values, image_grid_thw)
+            # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
+            per_token_logps = per_token_logps[:, prompt_length - 1 :]
+            completion_mask = new_attention_mask[:, prompt_length:]
+
+            with torch.inference_mode():
+                if self.ref_model is not None:
+                    ref_per_token_logps = self._get_per_token_logps(self.ref_model, new_input_ids, new_attention_mask, pixel_values, image_grid_thw)
+                else:
+                    with self.accelerator.unwrap_model(model).disable_adapter():
+                        ref_per_token_logps = self._get_per_token_logps(model, new_input_ids, new_attention_mask, pixel_values, image_grid_thw)
+            ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
+
+            # Compute the KL divergence between the model and the reference model
+            per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+            # DEBUG
+            # print(f"prompt_texts: {prompt_texts}")
+            # print(f"completions: {completion_texts}")
+            # print(f"number of completions: {len(new_input_ids)}")
+
+            # Compute the rewards
+            rewards_per_func = torch.zeros(len(new_input_ids), len(self.reward_funcs), device=device)
+
+            for i, (reward_func, reward_processing_class) in enumerate(
+                zip(self.reward_funcs, self.reward_processing_classes)
+            ):
+                if isinstance(reward_func, PreTrainedModel):
+                    if is_conversational(inputs[0]):
+                        messages = [{"messages": p + c} for p, c in zip(prompts, completions)]
+                        texts = [apply_chat_template(x, reward_processing_class)["text"] for x in messages]
+                    else:
+                        texts = [p + c for p, c in zip(prompts, completions)]
+                    reward_inputs = reward_processing_class(
+                        texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
+                    )
+                    reward_inputs = super()._prepare_inputs(reward_inputs)
+                    with torch.inference_mode():
+                        rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
+                else:
+                    reward_kwargs = {key: [example for example in inputs[key] for _ in range(num_generations)] for key in inputs.keys()}
+                    prompts = self.skip_special_tokens_from_text_list(prompt_texts)
+                    completions = self.skip_special_tokens_from_text_list(completion_texts)   
+                    reward_kwargs["prompts"] = prompts
+                    output_reward_func = reward_func(completions=completions, **reward_kwargs)
+                    rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
+
+            # Sum the rewards from all reward functions
+            rewards = rewards_per_func.sum(dim=1)
+
+            # Compute grouped-wise rewards
+            mean_grouped_rewards = rewards.view(-1, num_generations).mean(dim=1)
+            std_grouped_rewards = rewards.view(-1, num_generations).std(dim=1)
+        
+            # Normalize the rewards to compute the advantages, advantages has the shape (B*G,)
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(num_generations, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(num_generations, dim=0)
+            advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4) 
+
+            # x - x.detach() allows for preserving gradients from x
+            per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+            per_token_loss = -(per_token_loss - self.beta_rl * per_token_kl)
+
+            # aggregate the loss across tokens
+            loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+            # Log the metrics
+            completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+            self._metrics["train"]["rl/completion_length"].append(completion_length)
+
+            rewards_per_func = self.accelerator.gather_for_metrics(rewards_per_func).mean(0)
+            for i, reward_func in enumerate(self.reward_funcs):
+                if isinstance(reward_func, PreTrainedModel):
+                    reward_func_name = reward_func.config._name_or_path.split("/")[-1]
+                else:
+                    # Handle plain functions, functools.partial, and other callables
+                    if hasattr(reward_func, "__name__"):
+                        reward_func_name = reward_func.__name__
+                    elif hasattr(reward_func, "func") and hasattr(reward_func.func, "__name__"):
+                        # e.g., functools.partial
+                        reward_func_name = reward_func.func.__name__
+                    else:
+                        reward_func_name = reward_func.__class__.__name__
+                self._metrics["train"][f"rl/rewards/{reward_func_name}"].append(rewards_per_func[i].item())
+
+            self._metrics["train"]["rl/reward"].append(self.accelerator.gather_for_metrics(rewards).mean().item())
+
+            self._metrics["train"]["rl/reward_std"].append(self.accelerator.gather_for_metrics(std_grouped_rewards).mean().item())
+
+            mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+            self._metrics["train"]["rl/kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+
+            if verbose:
+                print(f"node: {self.accelerator.local_process_index}")
+                print(f"rewards: {rewards}")
+                print(f"rewards_per_func: {rewards_per_func}")
+                print(f"mean_grouped_rewards: {mean_grouped_rewards}")
+                print(f"std_grouped_rewards: {std_grouped_rewards}")
+                print(f"advantages: {advantages}")
+                print(f"per_token_kl: {per_token_kl}")
+                print(f"per_token_loss: {per_token_loss}")
+                print(f"completion_mask: {completion_mask}")
+                print(f"loss: {loss}")
+                print(f"metrics: {self._metrics['train']}")
+
+            return loss
+        
+        if self.use_uld_loss and self.teacher_tokenizer is not None:
+            raise NotImplementedError("ULD loss is not implemented for multimodal models")
+        else:
+            if self.use_liger_gkd_loss:
+                # Forward only through the base models (avoid lm_head to save memory)
+                unwrapped_student = self.accelerator.unwrap_model(model)
+                if hasattr(unwrapped_student, "get_decoder") and unwrapped_student.get_decoder() is not None:
+                    base_student = unwrapped_student.get_decoder()
+                else:
+                    base_student = getattr(
+                        unwrapped_student, getattr(unwrapped_student, "base_model_prefix", "model"), unwrapped_student
+                    )
+
+                student_outputs = base_student(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    pixel_values=inputs["pixel_values"],
+                    image_grid_thw=inputs["image_grid_thw"],
+                    use_cache=False,
+                )
+
+                self.teacher_model.eval()
+                unwrapped_teacher = self.accelerator.unwrap_model(self.teacher_model)
+                if hasattr(unwrapped_teacher, "get_decoder") and unwrapped_teacher.get_decoder() is not None:
+                    base_teacher = unwrapped_teacher.get_decoder()
+                else:
+                    base_teacher = getattr(
+                        unwrapped_teacher, getattr(unwrapped_teacher, "base_model_prefix", "model"), unwrapped_teacher
+                    )
+                with torch.no_grad():
+                    teacher_outputs = base_teacher(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        pixel_values=inputs["pixel_values"],
+                        image_grid_thw=inputs["image_grid_thw"],
+                        use_cache=False,
+                    )
+
+                # hidden states (shifted)
+                student_hidden = student_outputs.last_hidden_state[:, :-1]
+                teacher_hidden = teacher_outputs.last_hidden_state[:, :-1]
+
+                # Release full outputs to free memory
+                del student_outputs, teacher_outputs
+
+                # labels mask and labels (shifted)
+                labels_mask = inputs["labels"] != -100
+                masked_input_ids = torch.where(
+                    labels_mask, inputs["input_ids"], torch.full_like(inputs["input_ids"], -100)
+                )
+                true_labels = masked_input_ids[:, 1:].contiguous()
+
+                # heads
+                student_head = unwrapped_student.get_output_embeddings()
+                teacher_head = unwrapped_teacher.get_output_embeddings()
+
+                # liger fused jsd loss
+                loss = self.liger_jsd_loss(
+                    student_input=student_hidden,
+                    student_weight=student_head.weight,
+                    teacher_input=teacher_hidden,
+                    teacher_weight=teacher_head.weight,
+                    true_labels=true_labels,
+                    student_bias=getattr(student_head, "bias", None),
+                    teacher_bias=getattr(teacher_head, "bias", None),
+                )
+
+                # Release hidden states after loss computation
+                del student_hidden, teacher_hidden, true_labels
+            else:
+                # Original behavior for same tokenizer or when teacher_tokenizer is not provided
+                outputs_student = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    pixel_values=inputs["pixel_values"],
+                    image_grid_thw=inputs["image_grid_thw"],
+                )
+
+                self.teacher_model.eval()
+                with torch.no_grad():
+                    outputs_teacher = self.teacher_model(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                        pixel_values=inputs["pixel_values"],
+                        image_grid_thw=inputs["image_grid_thw"],
+                    )
+
+                prompt_lengths = inputs["prompts"].shape[1]
+                shifted_student_logits = outputs_student.logits[:, prompt_lengths - 1 : -1, :]
+                shifted_teacher_logits = outputs_teacher.logits[:, prompt_lengths - 1 : -1, :]
+                shifted_labels = inputs["labels"][:, prompt_lengths:]
+                loss = self.generalized_jsd_loss(
+                    student_logits=shifted_student_logits,
+                    teacher_logits=shifted_teacher_logits,
+                    labels=shifted_labels,
+                    beta=self.beta,
+                )
+
+        if self.use_uld_loss:
+            raise NotImplementedError("ULD loss is not implemented for multimodal models")
+
+        empty_cache()
+
+        return (loss, outputs_student) if return_outputs else loss
+
     @profiling_decorator
     def training_step(
-        self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
+        self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None, verbose: bool = True
     ) -> torch.Tensor:
         """
         Perform a training step for the General Online Logit Distillation (GOLD) model.
@@ -2003,52 +2293,63 @@ class GOLDMultimodalTrainer(SFTTrainer):
         `self.lmbda`, it generates new responses using the student model, which are then used for training instead of
         the offline original inputs.
         """
-        on_policy = False
-        if random.random() <= self.lmbda:
-            on_policy = True
-            if self.use_vllm:
-                self._wake_vllm_if_needed()
-                result = self._generate_on_policy_outputs_vllm(
-                    inputs, self.generation_config, self.processing_class.tokenizer.pad_token_id
-                )
-                new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
-            else:
-                with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
-                    result = self.generate_on_policy_outputs(
-                        unwrapped_model, inputs, self.generation_config, self.processing_class.tokenizer.pad_token_id
+        device = self.accelerator.device if hasattr(self.accelerator, "device") else torch.device("cpu")
+
+        if random.random() <= self.alpha:
+            if verbose:
+                print("Performing distillation")
+            on_policy = False
+            if random.random() <= self.lmbda:
+                on_policy = True
+                if self.use_vllm:
+                    assert False, "VLLM is not supported for multimodal models due to the incompatibility of the TRL vllm-server library."
+                    self._wake_vllm_if_needed()
+                    result = self._generate_on_policy_outputs_vllm(
+                        inputs, self.generation_config, self.processing_class.tokenizer.pad_token_id
                     )
                     new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
+                else:
+                    new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = self._on_policy_sampling(model, inputs)
 
-            inputs["input_ids"] = new_input_ids
-            inputs["attention_mask"] = new_attention_mask
-            inputs["labels"] = new_labels
+                inputs["input_ids"] = new_input_ids
+                inputs["attention_mask"] = new_attention_mask
+                inputs["labels"] = new_labels
 
-            # CRITICAL: Preserve original text for cross-tokenizer ULD loss
-            # This ensures both off-policy (dataset) and on-policy (generated) samples
-            # can use proper text-based alignment for different tokenizers
-            inputs["original_prompt_text"] = prompt_texts
-            inputs["original_completion_text"] = completion_texts
+                # CRITICAL: Preserve original text for cross-tokenizer ULD loss
+                # This ensures both off-policy (dataset) and on-policy (generated) samples
+                # can use proper text-based alignment for different tokenizers
+                inputs["original_prompt_text"] = prompt_texts
+                inputs["original_completion_text"] = completion_texts
 
-            # Log prompt and completion texts
-            self._textual_logs["prompt"].extend(gather_object(prompt_texts))
-            self._textual_logs["completion"].extend(gather_object(completion_texts))
+                # Log prompt and completion texts
+                self._textual_logs["prompt"].extend(gather_object(prompt_texts))
+                self._textual_logs["completion"].extend(gather_object(completion_texts))
 
-        loss = super().training_step(model, inputs, num_items_in_batch)
+            loss = super().training_step(model, inputs, num_items_in_batch)
 
-        loss_scalar = float(loss.detach())
-        ga = max(1, int(self.args.gradient_accumulation_steps))
-        step_equiv = 1.0 / ga
+            loss_scalar = float(loss.detach())
+            ga = max(1, int(self.args.gradient_accumulation_steps))
+            step_equiv = 1.0 / ga
 
-        if on_policy:
-            self._on_policy_loss_total += loss_scalar
-            self._on_policy_step_equiv += step_equiv
+            if on_policy:
+                self._on_policy_loss_total += loss_scalar
+                self._on_policy_step_equiv += step_equiv
+            else:
+                self._off_policy_loss_total += loss_scalar
+                self._off_policy_step_equiv += step_equiv
         else:
-            self._off_policy_loss_total += loss_scalar
-            self._off_policy_step_equiv += step_equiv
+            if verbose:
+                print("Performing GPRO")
+
+            self.use_rl_loss = True
+            loss = super().training_step(model, inputs, num_items_in_batch)
+            self.use_rl_loss = False
+
         return loss
 
     def log(self, logs: dict[str, float], start_time: float | None = None) -> None:
         mode = "train" if self.model.training else "eval"
+        print({key: val for key, val in self._metrics[mode].items()})
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
         if mode == "train":

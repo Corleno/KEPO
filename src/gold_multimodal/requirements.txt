@@ -5,3 +5,7 @@ vllm==0.11.2
 peft
 wandb
 deepspeed
+math_verify
+# To install flash-attn with --no-build-isolation, run:
+# pip install flash-attn --no-build-isolation
+flash-attn
