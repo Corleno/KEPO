@@ -1,13 +1,13 @@
 cd src/r1-v
 
-export CUDA_VISIBLE_DEVICES=4,5
+export CUDA_VISIBLE_DEVICES=4
 export DEBUG_MODE="true"
 export LOG_PATH="./debug_log_2b.txt"
 
 # export DEBUG_MODE="true" # Enable Debug if you want to see the rollout of model during RL
 # export LOG_PATH="./debug_log_2b.txt"
 
-torchrun --nproc_per_node=2 \
+torchrun --nproc_per_node=1 \
          --nnodes=1 \
          --node_rank=0 \
          --master_addr="127.0.0.1" \
@@ -31,4 +31,4 @@ torchrun --nproc_per_node=2 \
          --run_name Qwen2.5-VL-3B-GRPO-CT \
          --save_steps  100 \
          --save_only_model true \
-         --num_generations 8
+         --num_generations 4

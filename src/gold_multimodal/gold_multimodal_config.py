@@ -42,7 +42,11 @@ class GOLDMultimodalConfig(GOLDConfig):
     # With alpha = 1.0, the model will perform only distillation.
     # With alpha = 0.0, the model will perform GPRO only.
     alpha: float = 1.0
-    beta_rl: float = 1.0
+
+    # KL coefficient. If `0.0` (default), the reference model is not loaded, reducing memory usage and
+    # improving training speed. [DeepSeek-R1 incentivizes reasoning in LLMs through reinforcement
+    # learning](https://huggingface.co/papers/2501.12948) use a value of `0.001`.
+    beta_rl: float = 0.0 
 
     # Number of generations to sample for GPRO.
-    num_generations: int = 6
+    num_generations: int = 8

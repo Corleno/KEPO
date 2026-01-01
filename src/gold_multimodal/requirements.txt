@@ -1,11 +1,13 @@
 trl>=0.26.1
 liger_kernel>=0.6.4
-# latest trl only support vllm<=11.2
-vllm==0.11.2
 peft
 wandb
 deepspeed
 math_verify
-# To install flash-attn with --no-build-isolation, run:
-# pip install flash-attn --no-build-isolation
-flash-attn
+torch==2.8.0+cu128   
+torchvision==0.23.0+cu128   
+torchaudio==2.8.0+cu128
+# latest trl only support vllm<=11.2
+vllm>=0.10.0,<=0.11.2
+# flash-attn prebuilt wheel for CUDA 12.8, torch 2.8, Python 3.10
+https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.2/flash_attn-2.8.3%2Bcu128torch2.8-cp310-cp310-linux_x86_64.whl

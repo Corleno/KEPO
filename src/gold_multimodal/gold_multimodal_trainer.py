@@ -2056,7 +2056,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
             new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
         return new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, verbose=True):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, verbose=False):
         if self.use_rl_loss:
             assert return_outputs is False, "return_outputs must be False for RL loss"
 

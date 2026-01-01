@@ -15,6 +15,7 @@
 import os
 import textwrap
 from collections import defaultdict
+import time
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -285,10 +286,13 @@ class Qwen2VLGRPOTrainer(Trainer):
         self.max_prompt_length = args.max_prompt_length
         self.max_completion_length = args.max_completion_length  # = |o_i| in the GRPO paper
         self.num_generations = args.num_generations  # = G in the GRPO paper
+        # Hard code the generation config to avoid the time cost of beam search 
         self.generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,  
-            temperature=1, # HACK
+            temperature=1.0,
+            top_k=0, 
+            top_p=1, 
             num_return_sequences=self.num_generations,
             pad_token_id=pad_token_id,
         )
@@ -359,11 +363,12 @@ class Qwen2VLGRPOTrainer(Trainer):
     def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
         return inputs
 
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, verbose=False):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
     
-        
+        if verbose:
+            time_start = time.time()
 
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
@@ -387,14 +392,26 @@ class Qwen2VLGRPOTrainer(Trainer):
             prompt_ids = prompt_ids[:, -self.max_prompt_length :]
             prompt_mask = prompt_mask[:, -self.max_prompt_length :]
 
+        if verbose:
+            time_end = time.time()
+            print(f"Time taken to prepare prompt: {time_end - time_start}")
+            time_start = time.time()
+
         # Generate completions
         with unwrap_model_for_generation(model, self.accelerator) as unwrapped_model:
             prompt_completion_ids = unwrapped_model.generate(**prompt_inputs, generation_config=self.generation_config)
+            # unwrapped_model.generation_config = self.generation_config
+            # prompt_completion_ids = unwrapped_model.generate(**prompt_inputs)
 
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
             prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
+
+        if verbose:
+            time_end = time.time()
+            print(f"Time taken to generate completions: {time_end - time_start}")
+            time_start = time.time()
 
         # Mask everything after the first EOS token
         is_eos = completion_ids == self.processing_class.eos_token_id
@@ -413,6 +430,11 @@ class Qwen2VLGRPOTrainer(Trainer):
         # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
         per_token_logps = per_token_logps[:, prompt_length - 1 :]
 
+        if verbose:
+            time_end = time.time()
+            print(f"Time taken to compute per-token logps for target model: {time_end - time_start}")
+            time_start = time.time()
+
         with torch.inference_mode():
             if self.ref_model is not None:
                 ref_per_token_logps = self._get_per_token_logps(self.ref_model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw)
@@ -421,8 +443,18 @@ class Qwen2VLGRPOTrainer(Trainer):
                     ref_per_token_logps = self._get_per_token_logps(model, prompt_completion_ids, attention_mask, pixel_values, image_grid_thw)
         ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
 
+        if verbose:
+            time_end = time.time()
+            print(f"Time taken to compute per-token logps for reference model: {time_end - time_start}")
+            time_start = time.time()
+
         # Compute the KL divergence between the model and the reference model
         per_token_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+
+        if verbose:
+            time_end = time.time()
+            print(f"Time taken to compute KL divergence: {time_end - time_start}")
+            time_start = time.time()
 
         # Decode the generated completions
         completions = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -434,6 +466,12 @@ class Qwen2VLGRPOTrainer(Trainer):
         # print(f"number of completions: {len(completion_ids)}")
         # print(f"max completion length: {self.max_completion_length}")
         # import pdb; pdb.set_trace()
+
+        if verbose:
+            time_end = time.time()
+            print(f"Time taken to decode completions: {time_end - time_start}")
+            time_start = time.time()
+
         if is_conversational(inputs[0]):
             completions = [[{"role": "assistant", "content": completion}] for completion in completions]
 
@@ -466,6 +504,12 @@ class Qwen2VLGRPOTrainer(Trainer):
                 output_reward_func = reward_func(prompts=prompts, completions=completions, **reward_kwargs)
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
 
+        
+        if verbose:
+            time_end = time.time()
+            print(f"Time taken to compute rewards: {time_end - time_start}")
+            time_start = time.time()
+
         # Sum the rewards from all reward functions
         rewards = rewards_per_func.sum(dim=1)
 
@@ -482,6 +526,11 @@ class Qwen2VLGRPOTrainer(Trainer):
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
         per_token_loss = -(per_token_loss - self.beta * per_token_kl)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+
+        if verbose:
+            time_end = time.time()
+            print(f"Time taken to compute loss: {time_end - time_start}")
+            time_start = time.time()
 
         # Log the metrics
         completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
@@ -501,6 +550,11 @@ class Qwen2VLGRPOTrainer(Trainer):
 
         mean_kl = ((per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
         self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+
+        if verbose:
+            time_end = time.time()
+            print(f"Time taken to log metrics: {time_end - time_start}")
+            time_start = time.time()
 
         return loss
 

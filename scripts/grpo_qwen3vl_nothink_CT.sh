@@ -1,17 +1,17 @@
 cd src/r1-v
 
-export CUDA_VISIBLE_DEVICES=6
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export DEBUG_MODE="true"
 export LOG_PATH="./debug_log_2b.txt"
 
 # export DEBUG_MODE="true" # Enable Debug if you want to see the rollout of model during RL
 # export LOG_PATH="./debug_log_2b.txt"
 
-torchrun --nproc_per_node=1 \
+torchrun --nproc_per_node=4 \
          --nnodes=1 \
          --node_rank=0 \
          --master_addr="127.0.0.1" \
-         --master_port=8889 \
+         --master_port=12346 \
          -m src.open_r1.grpo_vqa_nothink \
          --output_dir /home/fayang/output/Med-R1/training/GRPO/GPRO_CT_from_Qwen3VL \
          --model_name_or_path  Qwen/Qwen3-VL-2B-Instruct \
@@ -20,7 +20,7 @@ torchrun --nproc_per_node=1 \
          --max_prompt_length 1024 \
          --max_completion_length 1024 \
          --per_device_train_batch_size 2 \
-         --gradient_accumulation_steps 2 \
+         --gradient_accumulation_steps 1 \
          --logging_steps 1 \
          --bf16 true \
          --report_to wandb \
@@ -28,7 +28,7 @@ torchrun --nproc_per_node=1 \
          --attn_implementation flash_attention_2 \
          --max_pixels 401408 \
          --num_train_epochs 1 \
-         --run_name Qwen3-VL-3B-GRPO-CT \
+         --run_name Qwen3-VL-2B-GRPO-CT \
          --save_steps  100 \
          --save_only_model true \
-         --num_generations 4
+         --num_generations 8
