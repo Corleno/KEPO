@@ -2,6 +2,8 @@ src/r1-v/debug_log_2b.txt
 __pycache__/
 wandb/
 gold-model/
+gold-model-RL/
+results/
 
 # Data files - keep test datasets small (< 50MB)
 # Ignore large dataset files (but allow small test datasets)

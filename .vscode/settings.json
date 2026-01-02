@@ -9,5 +9,9 @@
     "python.analysis.autoImportCompletions": true,
     "python.linting.enabled": true,
     "python.linting.pylintEnabled": false,
-    "python.linting.flake8Enabled": true
+    "python.linting.flake8Enabled": true,
+    "cursorpyright.analysis.autoImportCompletions": true,
+    "cursorpyright.analysis.extraPaths": [
+        "${workspaceFolder}/src/r1-v/src"
+    ]
 }

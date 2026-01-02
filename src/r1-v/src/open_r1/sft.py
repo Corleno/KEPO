@@ -58,6 +58,12 @@ from trl import (
     get_quantization_config,
 )
 
+from transformers import (
+    Qwen2VLForConditionalGeneration,
+    Qwen2_5_VLForConditionalGeneration,
+    Qwen3VLForConditionalGeneration,
+    AutoModelForCausalLM,
+)
 from qwen_vl_utils import process_vision_info
 logger = logging.getLogger(__name__)
 
@@ -248,10 +254,24 @@ def main(script_args, training_args, model_args):
         quantization_config=quantization_config,
     )
     # training_args.model_init_kwargs = model_kwargs
-    from transformers import Qwen2VLForConditionalGeneration
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
-        model_args.model_name_or_path, **model_kwargs
-    )
+    if "Qwen2-VL" in model_args.model_name_or_path:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            model_args.model_name_or_path, **model_kwargs
+        )
+    elif "Qwen2.5-VL" in model_args.model_name_or_path:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_args.model_name_or_path, **model_kwargs
+        )
+    elif "Qwen3-VL" in model_args.model_name_or_path:
+        # Qwen3-VL does not support `use_cache` during training
+        model_kwargs.pop("use_cache", None)
+        model = Qwen3VLForConditionalGeneration.from_pretrained(
+            model_args.model_name_or_path, **model_kwargs
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_args.model_name_or_path, **model_kwargs
+        )
     ############################
     # Initialize the SFT Trainer
     ############################
@@ -264,7 +284,6 @@ def main(script_args, training_args, model_args):
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        processing_class=processor.tokenizer,
         data_collator=collate_fn,
         peft_config=get_peft_config(model_args)
     )
