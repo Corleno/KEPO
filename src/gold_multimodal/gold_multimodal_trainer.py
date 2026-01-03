@@ -2293,7 +2293,8 @@ class GOLDMultimodalTrainer(SFTTrainer):
         `self.lmbda`, it generates new responses using the student model, which are then used for training instead of
         the offline original inputs.
         """
-        device = self.accelerator.device if hasattr(self.accelerator, "device") else torch.device("cpu")
+        # Set the use_rl_loss to False to avoid the RL loss being computed twice
+        self.use_rl_loss = False
 
         if random.random() <= self.alpha:
             if verbose:
