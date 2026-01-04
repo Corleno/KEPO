@@ -35,10 +35,11 @@ overwrite_output_dir: true
 per_device_eval_batch_size: 4
 per_device_train_batch_size: 4
 push_to_hub: false
-report_to: []  # 禁用 wandb
+report_to: wandb
 save_strategy: "steps"
 save_steps: 100
 seed: 42
 warmup_ratio: 0.1
 
+run_name: Qwen3-VL-2B-Instruct-SFT-MRI-600
 

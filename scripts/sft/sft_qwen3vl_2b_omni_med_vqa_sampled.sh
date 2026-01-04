@@ -1,5 +1,12 @@
 #!/bin/bash
 
+"""
+Train a Qwen3-VL-2B-Instruct model on the sampled Omni-Med-VQA dataset
+
+Example usage: bash scripts/sft/sft_qwen3vl_2b_omni_med_vqa_sampled.sh
+
+"""
+
 set -e
 
 # 进入 r1-v 子项目目录
