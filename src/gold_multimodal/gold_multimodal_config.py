@@ -43,6 +43,11 @@ class GOLDMultimodalConfig(GOLDConfig):
     # With alpha = 0.0, the model will perform GPRO only.
     alpha: float = 1.0
 
+    # Tau refers to the threshold for the on-policy knowledge distillation. 
+    # If the probability of the on-policy knowledge distillation is greater than tau, 
+    # the on-policy distillation will be performed. Otherwise, the off-policy distillation will be performed.
+    tau: float = None
+
     # KL coefficient. If `0.0` (default), the reference model is not loaded, reducing memory usage and
     # improving training speed. [DeepSeek-R1 incentivizes reasoning in LLMs through reinforcement
     # learning](https://huggingface.co/papers/2501.12948) use a value of `0.001`.

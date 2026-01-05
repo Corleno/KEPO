@@ -1041,7 +1041,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
         if not args.use_uld_loss:
             teacher_model.resize_token_embeddings(self.model.config.text_config.vocab_size)
 
-        if args.alpha > 0.0:
+        if args.alpha > 0.0 or args.tau is not None:
             if self.is_deepspeed_enabled:
                 self.teacher_model = prepare_deepspeed(teacher_model, self.accelerator)
             else:
@@ -1091,6 +1091,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
         self.reward_processing_classes = reward_processing_classes
 
         self.alpha = args.alpha
+        self.tau = args.tau
         self.lmbda = args.lmbda
         self.beta = args.beta
         self.beta_rl = args.beta_rl
@@ -2056,6 +2057,53 @@ class GOLDMultimodalTrainer(SFTTrainer):
             new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
         return new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts
 
+    def _compute_on_policy_knowledge_distillation(self, inputs, model):
+        """
+        Compute the on-policy knowledge distillation loss.
+        This function is used to compute the on-policy knowledge distillation loss.
+
+        Args:
+            inputs: A dictionary containing the inputs to the model.
+                - input_ids: The input IDs to the model.
+                - attention_mask: The attention mask to the model.
+                - pixel_values: The pixel values to the model.
+                - image_grid_thw: The image grid to the model.
+                - prompts: The prompts to the model.
+                - labels: The labels to the model.
+            model: The model to use for the on-policy knowledge distillation.
+
+        Returns:
+            loss: The loss for the on-policy knowledge distillation.
+            outputs_student: The outputs of the student model.
+        """
+        outputs_student = model(
+            input_ids=inputs["input_ids"],
+            attention_mask=inputs["attention_mask"],
+            pixel_values=inputs["pixel_values"],
+            image_grid_thw=inputs["image_grid_thw"],
+        )
+
+        self.teacher_model.eval()
+        with torch.no_grad():
+            outputs_teacher = self.teacher_model(
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                pixel_values=inputs["pixel_values"],
+                image_grid_thw=inputs["image_grid_thw"],
+            )
+
+        prompt_lengths = inputs["prompts"].shape[1]
+        shifted_student_logits = outputs_student.logits[:, prompt_lengths - 1 : -1, :]
+        shifted_teacher_logits = outputs_teacher.logits[:, prompt_lengths - 1 : -1, :]
+        shifted_labels = inputs["labels"][:, prompt_lengths:]
+        loss = self.generalized_jsd_loss(
+            student_logits=shifted_student_logits,
+            teacher_logits=shifted_teacher_logits,
+            labels=shifted_labels,
+            beta=self.beta,
+        )
+        return loss, outputs_student
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, verbose=False):
         if self.use_rl_loss:
             assert return_outputs is False, "return_outputs must be False for RL loss"
@@ -2065,22 +2113,24 @@ class GOLDMultimodalTrainer(SFTTrainer):
             prompt_length = prompt_ids.size(1)
             num_generations = self.generation_rl_config.num_return_sequences
 
+            # Repeat the prompts for each generation
+            new_prompts = prompt_ids.repeat_interleave(num_generations, dim=0)
             # Generate completions
             new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = self._on_policy_sampling(model, inputs, generation_config = self.generation_rl_config)
             
-            pixel_values = inputs["pixel_values"].repeat_interleave(num_generations, dim=0)
-            image_grid_thw = inputs["image_grid_thw"].repeat_interleave(num_generations, dim=0)
-            per_token_logps = self._get_per_token_logps(model, new_input_ids, new_attention_mask, pixel_values, image_grid_thw)
+            new_pixel_values = inputs["pixel_values"].repeat_interleave(num_generations, dim=0)
+            new_image_grid_thw = inputs["image_grid_thw"].repeat_interleave(num_generations, dim=0)
+            per_token_logps = self._get_per_token_logps(model, new_input_ids, new_attention_mask, new_pixel_values, new_image_grid_thw)
             # Get rid of the prompt (-1 because of the shift done in get_per_token_logps)
             per_token_logps = per_token_logps[:, prompt_length - 1 :]
             completion_mask = new_attention_mask[:, prompt_length:]
 
             with torch.inference_mode():
                 if self.ref_model is not None:
-                    ref_per_token_logps = self._get_per_token_logps(self.ref_model, new_input_ids, new_attention_mask, pixel_values, image_grid_thw)
+                    ref_per_token_logps = self._get_per_token_logps(self.ref_model, new_input_ids, new_attention_mask, new_pixel_values, new_image_grid_thw)
                 else:
                     with self.accelerator.unwrap_model(model).disable_adapter():
-                        ref_per_token_logps = self._get_per_token_logps(model, new_input_ids, new_attention_mask, pixel_values, image_grid_thw)
+                        ref_per_token_logps = self._get_per_token_logps(model, new_input_ids, new_attention_mask, new_pixel_values, new_image_grid_thw)
             ref_per_token_logps = ref_per_token_logps[:, prompt_length - 1 :]
 
             # Compute the KL divergence between the model and the reference model
@@ -2136,7 +2186,32 @@ class GOLDMultimodalTrainer(SFTTrainer):
             # aggregate the loss across tokens
             loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
+            distillation_loss = torch.tensor(0.0, device=device)
+            if self.tau is not None:
+                # Mask for rewards above or equal to tau
+                reward_mask = rewards >= self.tau
+                
+                inputs["input_ids"] = new_input_ids
+                inputs["attention_mask"] = new_attention_mask
+                inputs["pixel_values"] = new_pixel_values
+                inputs["image_grid_thw"] = new_image_grid_thw
+                inputs["prompts"] = new_prompts
+                inputs["labels"] = new_labels
+
+                # set masked labels to -100
+                inputs["labels"] = torch.where(
+                    reward_mask.unsqueeze(1), 
+                    inputs["labels"], 
+                    torch.full_like(inputs["labels"], -100),
+                )
+
+                distillation_loss, outputs_student = self._compute_on_policy_knowledge_distillation(inputs, model)
+                
+                loss = loss + distillation_loss
+
             # Log the metrics
+            self._metrics["train"]["rl/distillation_loss"].append(self.accelerator.gather_for_metrics(distillation_loss).mean().item())
+
             completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
             self._metrics["train"]["rl/completion_length"].append(completion_length)
 
@@ -2247,33 +2322,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
                 # Release hidden states after loss computation
                 del student_hidden, teacher_hidden, true_labels
             else:
-                # Original behavior for same tokenizer or when teacher_tokenizer is not provided
-                outputs_student = model(
-                    input_ids=inputs["input_ids"],
-                    attention_mask=inputs["attention_mask"],
-                    pixel_values=inputs["pixel_values"],
-                    image_grid_thw=inputs["image_grid_thw"],
-                )
-
-                self.teacher_model.eval()
-                with torch.no_grad():
-                    outputs_teacher = self.teacher_model(
-                        input_ids=inputs["input_ids"],
-                        attention_mask=inputs["attention_mask"],
-                        pixel_values=inputs["pixel_values"],
-                        image_grid_thw=inputs["image_grid_thw"],
-                    )
-
-                prompt_lengths = inputs["prompts"].shape[1]
-                shifted_student_logits = outputs_student.logits[:, prompt_lengths - 1 : -1, :]
-                shifted_teacher_logits = outputs_teacher.logits[:, prompt_lengths - 1 : -1, :]
-                shifted_labels = inputs["labels"][:, prompt_lengths:]
-                loss = self.generalized_jsd_loss(
-                    student_logits=shifted_student_logits,
-                    teacher_logits=shifted_teacher_logits,
-                    labels=shifted_labels,
-                    beta=self.beta,
-                )
+                loss, outputs_student = self._compute_on_policy_knowledge_distillation(inputs, model)
 
         if self.use_uld_loss:
             raise NotImplementedError("ULD loss is not implemented for multimodal models")
