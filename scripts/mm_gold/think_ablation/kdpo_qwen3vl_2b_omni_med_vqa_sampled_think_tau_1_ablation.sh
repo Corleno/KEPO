@@ -20,13 +20,13 @@ torchrun --nproc_per_node=8 \
          --bf16 true \
          --per_device_train_batch_size 2 \
          --gradient_accumulation_steps 1 \
-         --output_dir /mnt/task_runtime/output/MM-GOLD/Qwen3-VL-2B-KDPO-MRI-600-think-tau-0 \
+         --output_dir /mnt/task_runtime/output/MM-GOLD/Qwen3-VL-2B-KDPO-MRI-600-think-tau-1 \
          --num_train_epochs 5 \
          --alpha 0.0 \
-         --tau 0.0 \
+         --tau 1.0 \
          --save_strategy steps \
          --save_steps 10 \
          --num_generations 8 \
          --attn_implementation flash_attention_2 \
          --reward_funcs accuracy format \
-         --run_name Qwen3-VL-2B-KDPO-MRI-600-think-tau-0 \
+         --run_name Qwen3-VL-2B-KDPO-MRI-600-think-tau-1 \
