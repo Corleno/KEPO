@@ -2315,9 +2315,9 @@ class GOLDMultimodalTrainer(SFTTrainer):
 
                     if response_length_enhanced > response_length:
                         # padding the new_input_ids, new_attention_mask, new_labels with -100s to the response length of the knowledge enhanced samples
-                        new_input_ids = torch.cat([torch.full((num_samples, response_length_enhanced - response_length), self.processing_class.tokenizer.pad_token_id, device=device), new_input_ids], dim=1)
-                        new_attention_mask = torch.cat([torch.full((num_samples, response_length_enhanced - response_length), 0, device=device), new_attention_mask], dim=1)
-                        new_labels = torch.cat([torch.full((num_samples, response_length_enhanced - response_length), -100, device=device), new_labels], dim=1)
+                        new_input_ids = torch.cat([new_input_ids, torch.full((num_samples, response_length_enhanced - response_length), self.processing_class.tokenizer.pad_token_id, device=device)], dim=1)
+                        new_attention_mask = torch.cat([new_attention_mask, torch.full((num_samples, response_length_enhanced - response_length), 0, device=device)], dim=1)
+                        new_labels = torch.cat([new_labels, torch.full((num_samples, response_length_enhanced - response_length), -100, device=device)], dim=1)
                     
                     # randomly replace num_knowledge_enhancement rollout samples for each prompt with the corresponding knowledge enhanced samples
                     for i in range(prompt_ids.shape[0]):
