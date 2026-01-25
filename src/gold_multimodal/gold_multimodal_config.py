@@ -58,3 +58,6 @@ class GOLDMultimodalConfig(GOLDConfig):
 
     # Number of knowledge enhancement samples to generate
     num_knowledge_enhancement: int = 0
+
+    # Maximum number of attempts to generate the knowledge enhanced samples
+    max_attempts: int = 5

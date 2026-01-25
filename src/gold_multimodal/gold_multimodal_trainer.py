@@ -1101,6 +1101,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
         self.top_p = args.top_p
         self.seq_kd = args.seq_kd
         self.num_knowledge_enhancement = args.num_knowledge_enhancement
+        self.max_attempts = args.max_attempts
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
         self._on_policy_loss_total = 0.0
@@ -2141,7 +2142,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
             new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
         return new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts
 
-    def _rejective_sampling_with_hint(self, hint_texts, model, inputs, accelerator=None, generate_on_policy_outputs=None, generation_config=None, processing_class=None, max_attempts=1):
+    def _rejective_sampling_with_hint(self, hint_texts, model, inputs, accelerator=None, generate_on_policy_outputs=None, generation_config=None, processing_class=None, max_attempts=5):
         if accelerator is None:
             accelerator = self.accelerator
         if generate_on_policy_outputs is None:
@@ -2182,10 +2183,12 @@ class GOLDMultimodalTrainer(SFTTrainer):
         num_attempts = 0 # initialize the number of attempts to 0
         # keep sampling until the output is valid
         while not flag and num_attempts < max_attempts:
-            print(f"Attempt {num_attempts} of {max_attempts} to generate the hint aware completions")
+            print(f"Attempt {num_attempts} of {max_attempts} to generate the hint aware completions for GPU {accelerator.device}")
             num_attempts += 1
             # on-policy sampling with the new inputs which has the hint aware prompt texts
+            # print(f"start generation for GPU {accelerator.device}")
             with unwrap_model_for_generation(model, accelerator) as unwrapped_model:
+                # print(f"gpu device: {accelerator.device}, model: {unwrapped_model}, new_inputs: {new_inputs}, generation_config: {generation_config}")
                 result = generate_on_policy_outputs(
                     unwrapped_model, new_inputs, generation_config, processing_class.tokenizer.pad_token_id
                 )
@@ -2278,20 +2281,67 @@ class GOLDMultimodalTrainer(SFTTrainer):
                 rewards_per_func[:, i] = torch.tensor(output_reward_func, dtype=torch.float32, device=device)
         return rewards_per_func
 
+    def _distillate_hint(self, inputs):
+        """
+        Distillate the hint from the teacher model.
+        """
+        # get the hint for the knowledge enhancement
+        _, hint_completion_texts = self._hint_sampling(inputs, generation_config = self.hint_generation_config)
+        # extract the hint from the hint_completion_texts by extracting the content in <hint> </hint> tags
+        hint_texts = [re.search(r'<hint>(.*?)</hint>', text).group(1) for text in hint_completion_texts]
+        return hint_texts
+
+    def _inject_knowledge_enhanced_samples(self, num_prompts, num_samples, num_generations, new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts, new_enhanced_input_ids, new_enhanced_attention_mask, new_enhanced_labels, new_enhanced_prompt_texts, new_enhanced_completion_texts, device):
+        """
+        Inject the knowledge enhanced samples into the inputs.
+        Note: we will keep the original prompt text but replace the original completion text with the knowledge enhanced completion text.
+        """
+
+        # copy the new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts
+        new_input_ids_copy = new_input_ids.clone()
+        new_attention_mask_copy = new_attention_mask.clone()
+        new_labels_copy = new_labels.clone()
+        prompt_texts_copy = prompt_texts.copy()
+        completion_texts_copy = completion_texts.copy()
+
+        # get the prompt length from the new_labels by counting the number of consecutive -100s at the beginning of the new_labels
+        prompt_length = ((new_labels[0] == -100).diff().ne(0).nonzero(as_tuple=False).flatten()[0] + 1 if (new_labels[0] == -100).any() else 0)
+        prompt_length_enhanced = ((new_enhanced_labels[0] == -100).diff().ne(0).nonzero(as_tuple=False).flatten()[0] + 1 if (new_enhanced_labels[0] == -100).any() else 0)
+        response_length = new_labels.shape[1] - prompt_length
+        response_length_enhanced = new_enhanced_labels.shape[1] - prompt_length_enhanced
+
+        if response_length_enhanced > response_length:
+            # padding the new_input_ids_copy, new_attention_mask_copy, new_labels_copy with -100s to the response length of the knowledge enhanced samples
+            new_input_ids_copy = torch.cat([new_input_ids_copy, torch.full((num_samples, response_length_enhanced - response_length), self.processing_class.tokenizer.pad_token_id, device=device)], dim=1)
+            new_attention_mask_copy = torch.cat([new_attention_mask_copy, torch.full((num_samples, response_length_enhanced - response_length), 0, device=device)], dim=1)
+            new_labels_copy = torch.cat([new_labels_copy, torch.full((num_samples, response_length_enhanced - response_length), -100, device=device)], dim=1)
+        
+        # randomly replace num_knowledge_enhancement rollout samples for each prompt with the corresponding knowledge enhanced samples
+        for i in range(num_prompts):
+            # randomly select num_knowledge_enhancement indices from the num_generations indices
+            indices = torch.randint(0, num_generations, (self.num_knowledge_enhancement,)) + i * num_generations
+            indices_enhanced = [i * self.num_knowledge_enhancement + j for j in range(self.num_knowledge_enhancement)]
+            # replace the corresponding rollout samples with the knowledge enhanced samples
+            new_input_ids_copy[indices, prompt_length:] = self.processing_class.tokenizer.pad_token_id
+            new_input_ids_copy[indices, prompt_length:prompt_length + response_length_enhanced] = new_enhanced_input_ids[indices_enhanced, prompt_length_enhanced:]
+            new_attention_mask_copy[indices, prompt_length:] = 0
+            new_attention_mask_copy[indices, prompt_length:prompt_length + response_length_enhanced] = new_enhanced_attention_mask[indices_enhanced, prompt_length_enhanced:]
+            new_labels_copy[indices, prompt_length:] = -100
+            new_labels_copy[indices, prompt_length:prompt_length + response_length_enhanced] = new_enhanced_labels[indices_enhanced, prompt_length_enhanced:]
+            for j in range(self.num_knowledge_enhancement):
+                completion_texts_copy[indices[j]] = new_enhanced_completion_texts[indices_enhanced[j]]
+        
+        return new_input_ids_copy, new_attention_mask_copy, new_labels_copy, prompt_texts_copy, completion_texts_copy
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, verbose=False):
         if self.use_rl_loss:
             assert return_outputs is False, "return_outputs must be False for RL loss"
 
             device = self.accelerator.device
             prompt_ids = inputs["prompts"]
+            num_prompts = prompt_ids.shape[0]
             prompt_length = prompt_ids.size(1)
-            num_generations = self.generation_rl_config.num_return_sequences
-
-            if self.num_knowledge_enhancement > 0:
-                # get the hint for the knowledge enhancement
-                _, hint_completion_texts = self._hint_sampling(inputs, generation_config = self.hint_generation_config)
-                # extract the hint from the hint_completion_texts by extracting the content in <hint> </hint> tags
-                hint_texts = [re.search(r'<hint>(.*?)</hint>', text).group(1) for text in hint_completion_texts]
+            num_generations = self.generation_rl_config.num_return_sequences                
 
             # Repeat the prompts for each generation
             new_prompts = prompt_ids.repeat_interleave(num_generations, dim=0)
@@ -2303,43 +2353,52 @@ class GOLDMultimodalTrainer(SFTTrainer):
                 print(f"original prompt_texts: {prompt_texts}")
                 print(f"original completion_texts: {completion_texts}")
 
+            # Distillate the hint from the teacher model, generate the new prompts and completions using rejective sampling, and inject the knowledge enhanced samples into the inputs
             if self.num_knowledge_enhancement > 0:
+                # Cache the orignal batch samples
+                original_input_ids = new_input_ids
+                original_attention_mask = new_attention_mask
+                original_labels = new_labels
+                original_prompt_texts = prompt_texts
+                original_completion_texts = completion_texts
+                # Distillate the hint from the teacher model
+                hint_texts = self._distillate_hint(inputs)
                 # Given the hint texts, we need to generate the new prompts and completions using rejective sampling
-                flag, new_enhanced_input_ids, new_enhanced_attention_mask, new_enhanced_labels, new_enhanced_prompt_texts, new_enhanced_completion_texts = self._rejective_sampling_with_hint(hint_texts, model, inputs, generation_config = self.hint_generation_config)
-                if flag:
-                    # get the prompt length from the new_labels by counting the number of consecutive -100s at the beginning of the new_labels
-                    prompt_length = ((new_labels[0] == -100).diff().ne(0).nonzero(as_tuple=False).flatten()[0] + 1 if (new_labels[0] == -100).any() else 0)
-                    prompt_length_enhanced = ((new_enhanced_labels[0] == -100).diff().ne(0).nonzero(as_tuple=False).flatten()[0] + 1 if (new_enhanced_labels[0] == -100).any() else 0)
-                    response_length = new_labels.shape[1] - prompt_length
-                    response_length_enhanced = new_enhanced_labels.shape[1] - prompt_length_enhanced
+                flag, new_enhanced_input_ids, new_enhanced_attention_mask, new_enhanced_labels, new_enhanced_prompt_texts, new_enhanced_completion_texts = self._rejective_sampling_with_hint(hint_texts, model, inputs, generation_config = self.hint_generation_config, max_attempts = self.max_attempts)
+                print(f"rejective sampling with hint finished for GPU {self.accelerator.device}")
 
-                    if response_length_enhanced > response_length:
-                        # padding the new_input_ids, new_attention_mask, new_labels with -100s to the response length of the knowledge enhanced samples
-                        new_input_ids = torch.cat([new_input_ids, torch.full((num_samples, response_length_enhanced - response_length), self.processing_class.tokenizer.pad_token_id, device=device)], dim=1)
-                        new_attention_mask = torch.cat([new_attention_mask, torch.full((num_samples, response_length_enhanced - response_length), 0, device=device)], dim=1)
-                        new_labels = torch.cat([new_labels, torch.full((num_samples, response_length_enhanced - response_length), -100, device=device)], dim=1)
-                    
-                    # randomly replace num_knowledge_enhancement rollout samples for each prompt with the corresponding knowledge enhanced samples
-                    for i in range(prompt_ids.shape[0]):
-                        # randomly select num_knowledge_enhancement indices from the num_generations indices
-                        indices = torch.randint(0, num_generations, (self.num_knowledge_enhancement,)) + i * num_generations
-                        indices_enhanced = [i * self.num_knowledge_enhancement + j for j in range(self.num_knowledge_enhancement)]
-                        # replace the corresponding rollout samples with the knowledge enhanced samples
-                        new_input_ids[indices, prompt_length:] = self.processing_class.tokenizer.pad_token_id
-                        new_input_ids[indices, prompt_length:prompt_length + response_length_enhanced] = new_enhanced_input_ids[indices_enhanced, prompt_length_enhanced:]
-                        new_attention_mask[indices, prompt_length:] = 0
-                        new_attention_mask[indices, prompt_length:prompt_length + response_length_enhanced] = new_enhanced_attention_mask[indices_enhanced, prompt_length_enhanced:]
-                        new_labels[indices, prompt_length:] = -100
-                        new_labels[indices, prompt_length:prompt_length + response_length_enhanced] = new_enhanced_labels[indices_enhanced, prompt_length_enhanced:]
-                        for j in range(len(indices)):
-                            completion_texts[indices[j]] = new_enhanced_completion_texts[indices_enhanced[j]]
+                # Synchronize all processes before injecting enhanced samples
+                if self.accelerator is not None:
+                    self.accelerator.wait_for_everyone()
+                
+                if flag:
+                    # Inject the knowledge enhanced samples into the batch samples
+                    new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = self._inject_knowledge_enhanced_samples(
+                        num_prompts,
+                        num_samples,
+                        num_generations,
+                        new_input_ids,
+                        new_attention_mask,
+                        new_labels,
+                        prompt_texts,
+                        completion_texts,
+                        new_enhanced_input_ids,
+                        new_enhanced_attention_mask,
+                        new_enhanced_labels,
+                        new_enhanced_prompt_texts,
+                        new_enhanced_completion_texts,
+                        device,
+                    )
                 else:
                     print("Rejective sampling with hint failed. Use the original samples for the RL loss computation.")
-                
+
             if verbose:
-                print(f"enhanced prompt_texts: {prompt_texts}")
-                print(f"enhanced_completion_texts: {completion_texts}")    
-                                    
+                # Analyze the rewards for the samples.
+                original_rewards_per_func = self._get_rewards(num_samples, inputs, num_generations, prompt_texts, original_completion_texts, device)
+                rewards_per_func = self._get_rewards(num_samples, inputs, num_generations, prompt_texts, completion_texts, device)
+                print(f"original_rewards_per_func: {original_rewards_per_func}")
+                print(f"rewards_per_func: {rewards_per_func}")
+
             new_pixel_values = inputs["pixel_values"].repeat_interleave(num_generations, dim=0)
             new_image_grid_thw = inputs["image_grid_thw"].repeat_interleave(num_generations, dim=0)
             per_token_logps = self._get_per_token_logps(model, new_input_ids, new_attention_mask, new_pixel_values, new_image_grid_thw)
