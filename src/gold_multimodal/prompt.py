@@ -6,3 +6,5 @@ HINT_PROMPT = "Your task: 1. You will get a correct answer for the question. 2. 
 
 HINT_AWARE_VQA_THINKING_PROMPT = "Your task: 1. Read the hint provided in <hint>...</hint> tags. 2. Think through the question step by step but do not explicitly mention the hint, enclose your reasoning process in <think>...</think> tags. 3. Then provide the correct single-letter choice (A, B, C, D,...) inside <answer>...</answer> tags. 4. No extra information or text outside of these tags. The hint is <hint>{hint}</hint>."
 
+HINT_AWARE_VQA_THINKING_PROMPT_V1 = "Your task: 1. Read the hint provided in <hint>...</hint> tags and the ground truth answer provided in <answer>...</answer> tags. 2. Think through the question step by step but do not explicitly mention the hint and the ground truth answer, enclose your reasoning process in <think>...</think> tags. 3. Then provide the correct single-letter choice (A, B, C, D,...) inside <answer>...</answer> tags. 4. No extra information or text outside of these tags. The hint is <hint>{hint}</hint> and the ground truth answer is <answer>{answer}</answer>."
+

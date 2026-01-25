@@ -61,3 +61,9 @@ class GOLDMultimodalConfig(GOLDConfig):
 
     # Maximum number of attempts to generate the knowledge enhanced samples
     max_attempts: int = 5
+
+    # Whether to use adaptive knowledge enhancement
+    use_adaptive_knowledge_enhancement: bool = False
+
+    # Hint aware VQA thinking prompt template version
+    hint_aware_vqa_thinking_prompt_version: str = "v0" # "v0" for the original hint aware VQA thinking prompt template, "v1" for the new hint aware VQA thinking prompt template which includes the ground truth answer

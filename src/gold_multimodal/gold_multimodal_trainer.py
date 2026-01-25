@@ -64,8 +64,12 @@ from trl.trainer.utils import (
     pad,
 )
 from .gold_multimodal_config import GOLDMultimodalConfig
-from .prompt import VQA_THINKING_PROMPT, HINT_PROMPT, HINT_AWARE_VQA_THINKING_PROMPT
+from .prompt import VQA_THINKING_PROMPT, HINT_PROMPT, HINT_AWARE_VQA_THINKING_PROMPT, HINT_AWARE_VQA_THINKING_PROMPT_V1
 
+version_to_prompt_template = {
+    "v0": HINT_AWARE_VQA_THINKING_PROMPT,
+    "v1": HINT_AWARE_VQA_THINKING_PROMPT_V1,
+}
 
 @dataclass
 class DataCollatorForMMChatML:
@@ -1102,7 +1106,8 @@ class GOLDMultimodalTrainer(SFTTrainer):
         self.seq_kd = args.seq_kd
         self.num_knowledge_enhancement = args.num_knowledge_enhancement
         self.max_attempts = args.max_attempts
-
+        self.use_adaptive_knowledge_enhancement = args.use_adaptive_knowledge_enhancement
+        self.hint_aware_vqa_thinking_prompt_version = args.hint_aware_vqa_thinking_prompt_version
         # Track per-step loss statistics for on/off-policy batches (used in logging)
         self._on_policy_loss_total = 0.0
         self._off_policy_loss_total = 0.0
@@ -2142,7 +2147,7 @@ class GOLDMultimodalTrainer(SFTTrainer):
             new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = result
         return new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts
 
-    def _rejective_sampling_with_hint(self, hint_texts, model, inputs, accelerator=None, generate_on_policy_outputs=None, generation_config=None, processing_class=None, max_attempts=5):
+    def _rejective_sampling_with_hint(self, hint_texts, model, inputs, accelerator=None, generate_on_policy_outputs=None, generation_config=None, processing_class=None, max_attempts=5, verbose=True):
         if accelerator is None:
             accelerator = self.accelerator
         if generate_on_policy_outputs is None:
@@ -2165,8 +2170,13 @@ class GOLDMultimodalTrainer(SFTTrainer):
                     clean_up_tokenization_spaces=False,
                 )
         # replace the orginal task by the specified task
-        hint_aware_prompt_texts = [prompt_text.replace(VQA_THINKING_PROMPT, HINT_AWARE_VQA_THINKING_PROMPT).format(hint=hint_text) for prompt_text, hint_text in zip(prompt_texts, hint_texts)]
-        
+        if self.hint_aware_vqa_thinking_prompt_version == "v0":
+            hint_aware_prompt_texts = [prompt_text.replace(VQA_THINKING_PROMPT, HINT_AWARE_VQA_THINKING_PROMPT).format(hint=hint_text) for prompt_text, hint_text in zip(prompt_texts, hint_texts)]
+        elif self.hint_aware_vqa_thinking_prompt_version == "v1":
+            hint_aware_prompt_texts = [prompt_text.replace(VQA_THINKING_PROMPT, HINT_AWARE_VQA_THINKING_PROMPT_V1).format(hint=hint_text, answer=answer) for prompt_text, hint_text, answer in zip(prompt_texts, hint_texts, inputs["solutions"])]
+        else:
+            raise ValueError(f"Invalid hint aware VQA thinking prompt version: {self.hint_aware_vqa_thinking_prompt_version}")
+
         hint_aware_prompt = processing_class.tokenizer(hint_aware_prompt_texts, return_tensors="pt", padding="longest", padding_side="left", truncation=True, add_special_tokens=False)
         hint_aware_prompt_ids = hint_aware_prompt["input_ids"]
         hint_aware_attention_mask = hint_aware_prompt["attention_mask"]
@@ -2180,9 +2190,10 @@ class GOLDMultimodalTrainer(SFTTrainer):
 
         # rejective sampling with the hint aware prompt texts
         flag = False # initilize the flag to False
+        global_flag = False # initilize the global flag to False
         num_attempts = 0 # initialize the number of attempts to 0
         # keep sampling until the output is valid
-        while not flag and num_attempts < max_attempts:
+        while not global_flag and num_attempts < max_attempts:
             print(f"Attempt {num_attempts} of {max_attempts} to generate the hint aware completions for GPU {accelerator.device}")
             num_attempts += 1
             # on-policy sampling with the new inputs which has the hint aware prompt texts
@@ -2192,23 +2203,29 @@ class GOLDMultimodalTrainer(SFTTrainer):
                 result = generate_on_policy_outputs(
                     unwrapped_model, new_inputs, generation_config, processing_class.tokenizer.pad_token_id
                 )
-                new_hint_aware_input_ids, new_hint_aware_attention_mask, new_hint_aware_labels, new_hint_aware_prompt_texts, new_hint_aware_completion_texts = result
-
-            # validate the output 
-            num_samples = new_hint_aware_input_ids.shape[0]
-            rewards_per_func = self._get_rewards(num_samples, inputs, generation_config.num_return_sequences, new_hint_aware_prompt_texts, new_hint_aware_completion_texts, self.accelerator.device)
-
-            # Note: We only validate the rewards for the accuracy which is the first dimension of the rewards_per_func
-            accuracy_rewards = rewards_per_func[:, 0]
-            # check if the accuracy rewards are all 1 
-            flag = accuracy_rewards.all() == 1
+            # if the flag is False, then we need to validate the output
             if not flag:
-                # delete new_hint_aware_input_ids, new_hint_aware_attention_mask, new_hint_aware_labels, new_hint_aware_prompt_texts, new_hint_aware_completion_texts
+                new_hint_aware_input_ids, new_hint_aware_attention_mask, new_hint_aware_labels, new_hint_aware_prompt_texts, new_hint_aware_completion_texts = result
+                # validate the output 
+                num_samples = new_hint_aware_input_ids.shape[0]
+                rewards_per_func = self._get_rewards(num_samples, inputs, generation_config.num_return_sequences, new_hint_aware_prompt_texts, new_hint_aware_completion_texts, self.accelerator.device)
+
+                # Note: We only validate the rewards for the accuracy which is the first dimension of the rewards_per_func
+                accuracy_rewards = rewards_per_func[:, 0]
+                # check if the accuracy rewards are all 1 
+                flag = accuracy_rewards.all() == 1
+            # if the flag is False, then we need to delete the new_hint_aware_input_ids, new_hint_aware_attention_mask, new_hint_aware_labels, new_hint_aware_prompt_texts, new_hint_aware_completion_texts
+            if not flag:
                 new_hint_aware_input_ids = None
                 new_hint_aware_attention_mask = None
                 new_hint_aware_labels = None
                 new_hint_aware_prompt_texts = None
                 new_hint_aware_completion_texts = None
+
+            global_flags = self.accelerator.gather_for_metrics(flag)
+            global_flag = global_flags.all().item()
+            if verbose:
+                print(f"local flag from GPU {accelerator.device}: {flag}, global_flags from GPU {accelerator.device}: {global_flags}\n")
 
         if flag:
             return True, new_hint_aware_input_ids, new_hint_aware_attention_mask, new_hint_aware_labels, new_hint_aware_prompt_texts, new_hint_aware_completion_texts
@@ -2333,6 +2350,58 @@ class GOLDMultimodalTrainer(SFTTrainer):
         
         return new_input_ids_copy, new_attention_mask_copy, new_labels_copy, prompt_texts_copy, completion_texts_copy
 
+
+    def _knowledge_enhancement(self, model, inputs, num_prompts, num_samples, num_generations, new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts, device, verbose=False):
+        """
+        Knowledge enhancement.
+        """
+       # Cache the orignal batch samples
+        original_input_ids = new_input_ids
+        original_attention_mask = new_attention_mask
+        original_labels = new_labels
+        original_prompt_texts = prompt_texts
+        original_completion_texts = completion_texts
+        if verbose:
+            print(f"start knowledge enhancement on device {self.accelerator.device}")
+        # Distillate the hint from the teacher model
+        hint_texts = self._distillate_hint(inputs)
+        if verbose:
+            print(f"distillate hint finished on device {self.accelerator.device}")
+        # Given the hint texts, we need to generate the new prompts and completions using rejective sampling
+        flag, new_enhanced_input_ids, new_enhanced_attention_mask, new_enhanced_labels, new_enhanced_prompt_texts, new_enhanced_completion_texts = self._rejective_sampling_with_hint(hint_texts, model, inputs, generation_config = self.hint_generation_config, max_attempts = self.max_attempts)
+        if verbose:
+            print(f"rejective sampling with hint finished on device {self.accelerator.device}")
+        
+        if flag:
+            # Inject the knowledge enhanced samples into the batch samples
+            new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = self._inject_knowledge_enhanced_samples(
+                num_prompts,
+                num_samples,
+                num_generations,
+                new_input_ids,
+                new_attention_mask,
+                new_labels,
+                prompt_texts,
+                completion_texts,
+                new_enhanced_input_ids,
+                new_enhanced_attention_mask,
+                new_enhanced_labels,
+                new_enhanced_prompt_texts,
+                new_enhanced_completion_texts,
+                device,
+            )
+        else:
+            print("Rejective sampling with hint failed. Use the original samples for the RL loss computation.")
+
+        if verbose:
+            # Analyze the rewards for the samples.
+            original_rewards_per_func = self._get_rewards(num_samples, inputs, num_generations, prompt_texts, original_completion_texts, device)
+            rewards_per_func = self._get_rewards(num_samples, inputs, num_generations, prompt_texts, completion_texts, device)
+            print(f"original_rewards_per_func: {original_rewards_per_func}")
+            print(f"rewards_per_func: {rewards_per_func}")
+        return new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts
+
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None, verbose=False):
         if self.use_rl_loss:
             assert return_outputs is False, "return_outputs must be False for RL loss"
@@ -2355,49 +2424,24 @@ class GOLDMultimodalTrainer(SFTTrainer):
 
             # Distillate the hint from the teacher model, generate the new prompts and completions using rejective sampling, and inject the knowledge enhanced samples into the inputs
             if self.num_knowledge_enhancement > 0:
-                # Cache the orignal batch samples
-                original_input_ids = new_input_ids
-                original_attention_mask = new_attention_mask
-                original_labels = new_labels
-                original_prompt_texts = prompt_texts
-                original_completion_texts = completion_texts
-                # Distillate the hint from the teacher model
-                hint_texts = self._distillate_hint(inputs)
-                # Given the hint texts, we need to generate the new prompts and completions using rejective sampling
-                flag, new_enhanced_input_ids, new_enhanced_attention_mask, new_enhanced_labels, new_enhanced_prompt_texts, new_enhanced_completion_texts = self._rejective_sampling_with_hint(hint_texts, model, inputs, generation_config = self.hint_generation_config, max_attempts = self.max_attempts)
-                print(f"rejective sampling with hint finished for GPU {self.accelerator.device}")
+                if self.use_adaptive_knowledge_enhancement:
+                    rewards_per_func = self._get_rewards(num_samples, inputs, num_generations, prompt_texts, completion_texts, device)
+                    # reformulate rewards_per_func to have the shape (num_prompts, num_generations, num_reward_funcs)
+                    rewards_per_func_reshaped = rewards_per_func.view(num_prompts, num_generations, -1)
+                    # check if any prompt has all zero rewards in rewards_per_func
+                    zero_rewards_mask = (rewards_per_func_reshaped == 0).all(dim=(1,2))  # shape: (num_prompts,)
 
-                # Synchronize all processes before injecting enhanced samples
-                if self.accelerator is not None:
-                    self.accelerator.wait_for_everyone()
-                
-                if flag:
-                    # Inject the knowledge enhanced samples into the batch samples
-                    new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = self._inject_knowledge_enhanced_samples(
-                        num_prompts,
-                        num_samples,
-                        num_generations,
-                        new_input_ids,
-                        new_attention_mask,
-                        new_labels,
-                        prompt_texts,
-                        completion_texts,
-                        new_enhanced_input_ids,
-                        new_enhanced_attention_mask,
-                        new_enhanced_labels,
-                        new_enhanced_prompt_texts,
-                        new_enhanced_completion_texts,
-                        device,
-                    )
+                    global_zero_rewards_mask = self.accelerator.gather_for_metrics(zero_rewards_mask).any().item()
+
+                    if global_zero_rewards_mask:
+                        if zero_rewards_mask.any():
+                            print(f"Exist {zero_rewards_mask.sum().item()} prompts with all zero rewards in rewards_per_func. Adaptive knowledge enhancement is triggered.")
+                            new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = self._knowledge_enhancement(model, inputs, num_prompts, num_samples, num_generations, new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts, device, verbose=verbose)
+                        else:
+                            print("No prompts with all zero rewards in rewards_per_func. Adaptive knowledge enhancement is not triggered.")
+                            _, _, _, _, _ = self._knowledge_enhancement(model, inputs, num_prompts, num_samples, num_generations, new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts, device, verbose=verbose)
                 else:
-                    print("Rejective sampling with hint failed. Use the original samples for the RL loss computation.")
-
-            if verbose:
-                # Analyze the rewards for the samples.
-                original_rewards_per_func = self._get_rewards(num_samples, inputs, num_generations, prompt_texts, original_completion_texts, device)
-                rewards_per_func = self._get_rewards(num_samples, inputs, num_generations, prompt_texts, completion_texts, device)
-                print(f"original_rewards_per_func: {original_rewards_per_func}")
-                print(f"rewards_per_func: {rewards_per_func}")
+                    new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts = self._knowledge_enhancement(model, inputs, num_prompts, num_samples, num_generations, new_input_ids, new_attention_mask, new_labels, prompt_texts, completion_texts, device, verbose=verbose)
 
             new_pixel_values = inputs["pixel_values"].repeat_interleave(num_generations, dim=0)
             new_image_grid_thw = inputs["image_grid_thw"].repeat_interleave(num_generations, dim=0)
