@@ -45,11 +45,15 @@ for CHKPT_PATH in "${CHECKPOINTS[@]}"; do
     # Extract checkpoint name or use base dir
     CHKPT_BASENAME=$(basename "${CHKPT_PATH}")
     if [[ "${CHKPT_BASENAME}" == checkpoint-* ]]; then
-        MODEL_NAME="Qwen3-VL-2B-KDPO-MRI-600-think-tau-0_${CHKPT_BASENAME}"
+        MODEL_NAME="Qwen3-VL-2B-KEPO-MRI-600-think-tau-0_${CHKPT_BASENAME}"
     else
-        MODEL_NAME="Qwen3-VL-2B-KDPO-MRI-600-think-tau-0"
+        MODEL_NAME="Qwen3-VL-2B-KEPO-MRI-600-think-tau-0"
     fi
     BASE_OUTPUT_DIR="/mnt/task_runtime/results/${MODEL_NAME}"
+    # remove the BASE_OUTPUT_DIR if it exists
+    if [ -d "${BASE_OUTPUT_DIR}" ]; then
+        rm -rf "${BASE_OUTPUT_DIR}"
+    fi
     mkdir -p "${BASE_OUTPUT_DIR}"
 
     echo "=========================================="
