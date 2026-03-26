@@ -12,11 +12,11 @@ torchrun --nproc_per_node=4 \
          --nnodes=1 \
          --node_rank=0 \
          --master_addr="127.0.0.1" \
-         --master_port=12346 \
-         -m open_r1.grpo_vqa_nothink \
-         --output_dir /mnt/task_runtime/output/Med-R1/training/GRPO/GPRO_CT_from_Qwen3VL_nothink \
+         --master_port=8888 \
+         -m open_r1.grpo_vqa \
+         --output_dir /mnt/task_runtime/output/Med-R1/training/DAPO/DARO_MRI_600_from_Qwen3VL \
          --model_name_or_path  Qwen/Qwen3-VL-2B-Instruct \
-         --dataset_name "/mnt/task_runtime/data/omni_med_vqa_processed/open_access_sft_data_hf_modality_CT(Computed_Tomography)_train" \
+         --dataset_name "/mnt/task_runtime/data/omni_med_vqa_processed_sampled/open_access_sft_data_hf_modality_MRI_train_600" \
          --deepspeed local_scripts/zero3.json \
          --max_prompt_length 1024 \
          --max_completion_length 1024 \
@@ -29,7 +29,8 @@ torchrun --nproc_per_node=4 \
          --attn_implementation flash_attention_2 \
          --max_pixels 401408 \
          --num_train_epochs 1 \
-         --run_name Qwen3-VL-2B-GRPO-CT-nothink \
+         --run_name Qwen3-VL-2B-DAPO-MRI-600 \
          --save_steps  100 \
          --save_only_model true \
-         --num_generations 8
+         --num_generations 8 \
+         --loss_type dapo
